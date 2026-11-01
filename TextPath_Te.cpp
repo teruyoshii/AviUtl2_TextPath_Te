@@ -4270,7 +4270,7 @@ FILTER_PLUGIN_TABLE g_filter_table = {
 	FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_FILTER,
 	PLUGIN_NAME,
 	L"teruyoshi",
-	L"テキストの輪郭をアンカーで編集できるパスに変換する v1.1.1 By teruyoshi",
+	L"テキストの輪郭をアンカーで編集できるパスに変換する v1.1.2 By teruyoshi",
 	g_items,
 	proc_video,
 	nullptr, nullptr, nullptr,
@@ -5945,7 +5945,7 @@ EXTERN_C __declspec(dllexport) void InitializeConfig(CONFIG_HANDLE* handle) {
 }
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
-	host->set_plugin_information(L"テキストの輪郭パス化 v1.1.1 By teruyoshi");
+	host->set_plugin_information(L"テキストの輪郭パス化 v1.1.2 By teruyoshi");
 	g_edit_handle = host->create_edit_handle();
 	host->register_filter_plugin(&g_filter_table);
 	host->register_object_menu(L"輪郭パス\\輪郭を作成・更新", on_object_menu<true>);

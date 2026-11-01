@@ -1,4 +1,4 @@
---information:輪郭パス v1.1.1 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
+--information:輪郭パス v1.1.2 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
 --label:teruyoshi
 --select@objMode:オブジェクトの分け方=0,全体で1つのオブジェクト=0,文字ごとに個別オブジェクト=1,アイランドごとに個別オブジェクト=2
 --check@pen:ペンで書く,false
@@ -237,8 +237,9 @@ if meta[1] == 4 then
 				outline.compose_part(data, 0, drawBase or {}, baseMeta, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 64, obj.effect_id)
 				if writing then write_pen(data, x, y, pw, ph) end
 				obj.putpixeldata("object", data, pw, ph)
-				obj.ox = obj.ox + (x * 2 + pw - w0) / 2
-				obj.oy = obj.oy + (y * 2 + ph - h0) / 2
+				-- 部品のずれは中心に入れる(obj.ox, obj.oyに入れると部品ごとに自分の位置を中心に回り、字がばらける)
+				obj.cx = obj.cx - (x * 2 + pw - w0) / 2
+				obj.cy = obj.cy - (y * 2 + ph - h0) / 2
 			else
 				-- 自分の輪郭が無い時(後から文字毎に個別オブジェクトをオンにした時の他の文字)は何も描かない
 				obj.alpha = 0
