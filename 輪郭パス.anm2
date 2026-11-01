@@ -1,0 +1,276 @@
+--information:輪郭パス v1.0 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
+--label:teruyoshi
+--select@objMode:オブジェクトの分け方=0,全体で1つのオブジェクト=0,文字ごとに個別オブジェクト=1,アイランドごとに個別オブジェクト=2
+--check@pen:ペンで書く,false
+--track@penT:書き進み,0,100,100,0.01
+--check@force:輪郭で描画,false
+--check@showHandle:ハンドルを表示,true
+--check@showLine:輪郭線を表示,true
+--color@lineColor:輪郭線の色,0x40c0ff
+--color@armColor:ハンドルの線の色,0xff9040
+--check@morph:2形状補間,false
+--track@morphT:補間,0,100,0,0.01
+--select@editShape:編集する形状=0,形状1=0,形状2=1
+--value@pts2:座標2,{0,0}
+--value@hnd2:ハンドル2,{0,0}
+--value@pts:座標,{0,0}
+--value@hnd:ハンドル,{0,0}
+--value@meta:輪郭情報,{0}
+--value@meta2:輪郭情報2,{0}
+--value@base:元の座標,{0,0}
+--value@base2:元の座標2,{0,0}
+--value@baseMeta:元の輪郭情報,{0}
+--value@strokes:筆順,{0}
+--value@expandPart:展開したアイランド,{0}
+--hide@penT:pen==0
+--hide@morphT:morph==0
+--hide@editShape:morph==0
+--hide@pts2:morph==0
+--hide@hnd2:morph==0
+--hide@pts
+--hide@hnd
+--hide@meta
+--hide@meta2
+--hide@base
+--hide@base2
+--hide@baseMeta
+--hide@strokes
+--hide@expandPart
+
+local outline = obj.module("TextPath_Te")
+
+if meta[1] == 4 then
+	-- 移動方法が付いていても比べられるように、テキストの設定は開始点(時刻0)の値で比べる
+	local v = obj.getvalue
+	local function start(item) return tonumber(v("テキスト", item, 0)) or 0 end
+	local function now(item) return tonumber(v("テキスト", item)) or 0 end
+	local key = string.format("%s|%s|%.2f|%.2f|%.2f|%s", tostring(v("テキスト", "テキスト")), tostring(v("テキスト", "フォント")),
+		start("サイズ"), start("字間"), start("行間"), tostring(v("テキスト", "文字揃え")))
+	local same_text = outline.text_hash(key) == meta[3]
+	local moving = now("サイズ") ~= start("サイズ") or now("字間") ~= start("字間") or now("行間") ~= start("行間")
+
+	-- ハンドルは持ち主のアンカーに追従する。アンカーを動かしてもハンドルの設定値は変わらないので、今の位置を計算する
+	local hndRaw, hndRaw2 = hnd, hnd2
+	hnd = outline.handles(pts, hndRaw, meta)
+	if meta2[1] == 4 then hnd2 = outline.handles(pts2, hndRaw2, meta2) end
+
+	-- 文字毎に個別オブジェクトの時は1文字ごとに実行され、画像もその文字だけになる
+	local multi = obj.num > 1
+	local glyph = multi and obj.index or -1
+	local w0, h0 = obj.w, obj.h
+
+	-- 2形状補間(形状の点の並びが同じ時だけ)
+	local blend = morph and meta2[1] == 4 and meta2[9] == meta[9] and meta2[10] == meta[10]
+	local t = blend and morphT / 100 or 0
+
+	local function ink_of(m)
+		if multi then return outline.glyph_ink(m, glyph) end
+		return m[7], m[8]
+	end
+	local inkLeft, inkTop = ink_of(meta)
+	if blend then
+		local l2, t2 = ink_of(meta2)
+		inkLeft, inkTop = inkLeft + (l2 - inkLeft) * t, inkTop + (t2 - inkTop) * t
+	end
+
+	-- 座標の原点は行の左上。本体の画像の大きさ・余白は文字の内容でも変わるので、画像のインクの位置から中心基準の位置を求める
+	local function measure()
+		local r = { key = key, w = w0, h = h0, left = inkLeft, top = inkTop, x = -w0 / 2, y = -h0 / 2, ink = false }
+		if same_text and inkLeft ~= -1 then
+			local il, it = outline.ink(obj.getpixeldata("object"), w0, h0)
+			if il >= 0 then
+				r.x = math.floor((il - inkLeft - w0 / 2) * 2 + 0.5) / 2
+				r.y = math.floor((it - inkTop - h0 / 2) * 2 + 0.5) / 2
+				r.ink = true
+			end
+		end
+		return r
+	end
+	TextPath_TeOffset = TextPath_TeOffset or {}
+	local store = TextPath_TeOffset[obj.effect_id]
+	if not store then
+		store = {}
+		TextPath_TeOffset[obj.effect_id] = store
+	end
+	local cache
+	if moving then
+		-- サイズ等が動いている間は画像も変わるので覚えない(形状2が無い時は、形状1との比較では合わないので画像の左上に置く)
+		if blend then
+			cache = measure()
+		else
+			cache = { x = -w0 / 2, y = -h0 / 2, ink = false }
+		end
+	else
+		cache = store[glyph]
+		if not cache or (same_text and (cache.key ~= key or cache.w ~= w0 or cache.h ~= h0 or cache.left ~= inkLeft or cache.top ~= inkTop)) then
+			cache = measure()
+			store[glyph] = cache
+		end
+	end
+	local ox, oy = cache.x, cache.y
+
+	-- 表示・編集する形状
+	local second = blend and editShape == 1
+	local showPts, showHnd, showMeta, showRaw = pts, hnd, meta, hndRaw
+	if second then showPts, showHnd, showMeta, showRaw = pts2, hnd2, meta2, hndRaw2 end
+	local anchorNum, handleNum = showMeta[9], showMeta[10]
+
+	-- 個別オブジェクトの時のアンカーは、最初の文字の処理の呼び出しだけが表示され、座標の基準は全文字を囲む枠の中心になる。
+	-- 枠はこの時点で分からないので、スクリーン座標で表示する(標準描画の回転・拡大には追従しない)
+	local mode = nil
+	if multi then
+		if cache.ink then store.origin = { x = obj.ox + ox, y = obj.oy + oy } end
+		if obj.index == 0 then mode = "screen" end
+	else
+		mode = "object"
+	end
+	if mode then
+		local ax, ay = ox, oy
+		if mode == "screen" then
+			local origin = store.origin or { x = obj.ox + ox, y = obj.oy + oy }
+			ax, ay = obj.x + origin.x, obj.y + origin.y
+		end
+		local ptsName, hndName = second and "pts2" or "pts", second and "hnd2" or "hnd"
+		local function anchor(name, num, ...)
+			if mode == "screen" then
+				obj.setanchor(name, num, "small", "screen", "offset", ax, ay, ...)
+			else
+				obj.setanchor(name, num, "small", "offset", ax, ay, ...)
+			end
+		end
+		local function line(tbl, num, color)
+			if mode == "screen" then
+				obj.setanchor(tbl, num, "line", "color", color, "screen")
+			else
+				obj.setanchor(tbl, num, "line", "color", color)
+			end
+		end
+		-- アンカーの丸の色は変えられない(色が付くのは線だけ)ので、全てsmallにして線で見分ける:
+		-- アンカーは輪郭線の上に乗り、ハンドルはアンカーから伸びる別の色の線の先にある
+		-- アンカーを先に呼ぶ(重なった時は先に呼んだ方を掴める。高度な編集でしまったハンドルはアンカーに重なる)
+		if anchorNum > 0 then anchor(ptsName, anchorNum) end
+		if handleNum > 0 and showHandle then
+			-- アンカーの丸は変数ではなく保存された設定値の位置に出る。ただし設定値の数と合わない時は、渡したテーブルの位置に出る。
+			-- そこで、今のハンドルの位置 + 基準(今のアンカーの位置を画面の外へ出したもの)を渡す。ハンドルを動かすとこれが丸ごと保存される。
+			-- 数を必ず合わせないために、設定値の数と同じになる時は調整用の点を1つ足す
+			local far = 100000
+			local positions = {}
+			for i = 1, handleNum * 2 do positions[i] = showHnd[i] end
+			for i = 1, anchorNum * 2 do positions[handleNum * 2 + i] = showPts[i] + far end
+			local num = handleNum + anchorNum
+			if #showRaw / 2 == num then
+				positions[num * 2 + 1], positions[num * 2 + 2] = far, far
+				num = num + 1
+			end
+			anchor(hndName, num, positions)
+		end
+		if obj.getoption("gui") and (showLine or showHandle) then
+			local outlineLines, arms = outline.lines(showPts, showHnd, showMeta, ax, ay)
+			if showLine then
+				local i = 1
+				while i <= #outlineLines do
+					local count = outlineLines[i]
+					local tbl = {}
+					for k = 1, count * 2 do tbl[k] = outlineLines[i + k] end
+					line(tbl, count, lineColor)
+					i = i + count * 2 + 1
+				end
+			end
+			if showHandle then
+				for i = 1, #arms, 4 do
+					line({ arms[i], arms[i + 1], arms[i + 2], arms[i + 3] }, 2, armColor)
+				end
+			end
+		end
+	end
+
+	-- 無編集で、テキストの設定も作成時のままなら、元の画像をそのまま通す(ボタンの前後で画が変わらない。サイズ等が動いていても同じ)
+	local edited = outline.edited(pts, hnd, meta, glyph) or (blend and outline.edited(pts2, hnd2, meta2, glyph))
+	-- テキストの「文字毎に個別オブジェクト」がオンの時は本体が既に文字ごとに分けているので、アイランドごとの時だけさらに分ける
+	local split = objMode == 2 or (objMode == 1 and not multi)
+	-- 描く座標(補間する時は2つの形状の間)
+	local drawPts, drawHnd = pts, hnd
+	if blend and t ~= 0 then
+		drawPts, drawHnd = {}, {}
+		for i = 1, meta[9] * 2 do drawPts[i] = pts[i] + (pts2[i] - pts[i]) * t end
+		for i = 1, meta[10] * 2 do drawHnd[i] = hnd[i] + (hnd2[i] - hnd[i]) * t end
+	end
+	-- ペンで書く: 位置が合わせられる時だけ(テキストの設定を変えた時、動いていて形状2が無い時は全体を表示する)
+	local writing = pen and penT < 100 and same_text and (not moving or blend)
+	local function write_pen(data, x, y, pw, ph)
+		outline.pen(data, pw, ph, x, y, w0, h0, ox, oy, drawPts, drawHnd, meta, strokes, pts, hnd, obj.effect_id, penT / 100)
+	end
+	-- タイムラインへ展開したオブジェクトは、自分のアイランドの輪郭だけを持ち、それだけを描く
+	local expanded = expandPart[1] == 1
+	if force or not same_text or edited or split or expanded then
+		local color = tonumber(tostring(v("テキスト", "文字色")), 16) or 0xffffff
+		local r, g, b = RGB(color)
+		-- 編集しただけなら、動かしていない部分は本体の画像のまま残す(自前の塗りとは縁の濃さが僅かに違うので)
+		local drawBase = nil
+		if not force and same_text and cache.ink and (not moving or blend) and baseMeta[1] == 4 and #base == (baseMeta[9] + baseMeta[10]) * 2 then
+			drawBase = base
+			if blend and t ~= 0 and #base2 == #base then
+				drawBase = {}
+				for i = 1, #base do drawBase[i] = base[i] + (base2[i] - base[i]) * t end
+			end
+		end
+		if drawBase or split or expanded then outline.capture(obj.getpixeldata("object"), w0, h0) end
+		if expanded then
+			if outline.parts(drawPts, drawHnd, meta, 1, glyph) > 0 then
+				local x, y, pw, ph = outline.part_rect(0, ox, oy, w0, h0)
+				obj.clearbuffer("object", pw, ph)
+				local data = obj.getpixeldata("object")
+				outline.compose_part(data, 0, drawBase or {}, baseMeta, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 64)
+				if writing then write_pen(data, x, y, pw, ph) end
+				obj.putpixeldata("object", data, pw, ph)
+				obj.ox = obj.ox + (x * 2 + pw - w0) / 2
+				obj.oy = obj.oy + (y * 2 + ph - h0) / 2
+			else
+				-- 自分の輪郭が無い時(後から文字毎に個別オブジェクトをオンにした時の他の文字)は何も描かない
+				obj.alpha = 0
+			end
+			return
+		end
+		if split then
+			local count = outline.parts(drawPts, drawHnd, meta, objMode, glyph)
+			if count > 0 then
+				local ox0, oy0 = obj.ox, obj.oy
+				-- 番号は自分で数える(文字毎に個別オブジェクトの中で呼ぶと、obj.indexが文字の番号のままになる)
+				local nextPart = 0
+				obj.multiobject(count, function()
+					local part = nextPart
+					nextPart = nextPart + 1
+					local x, y, pw, ph = outline.part_rect(part, ox, oy, w0, h0)
+					obj.clearbuffer("object", pw, ph)
+					local data = obj.getpixeldata("object")
+					outline.compose_part(data, part, drawBase or {}, baseMeta, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 255)
+					if writing then write_pen(data, x, y, pw, ph) end
+					obj.putpixeldata("object", data, pw, ph)
+					obj.ox = ox0 + (x * 2 + pw - w0) / 2
+					obj.oy = oy0 + (y * 2 + ph - h0) / 2
+				end)
+				obj.ox, obj.oy = ox0, oy0
+			end
+			return
+		end
+		-- 中心を保ったまま、全ての点が収まる大きさにする
+		local bx, by = outline.bounds(drawPts, drawHnd, meta, ox, oy, glyph)
+		local w = w0 + math.ceil(math.max(bx, w0 / 2) - w0 / 2) * 2 + 2	-- 偶奇を保つ(変えると中心が0.5pxずれる)
+		local h = h0 + math.ceil(math.max(by, h0 / 2) - h0 / 2) * 2 + 2
+		obj.clearbuffer("object", w, h)
+		local data = obj.getpixeldata("object")
+		if drawBase then
+			outline.compose(data, w, h, drawPts, drawHnd, meta, drawBase, baseMeta, r, g, b, ox, oy, glyph)
+		else
+			outline.fill(data, w, h, drawPts, drawHnd, meta, r, g, b, ox, oy, glyph)
+		end
+		-- 画像を広げても中心は同じなので、全体の大きさを今の大きさとして渡す
+		w0, h0 = w, h
+		if writing then write_pen(data, 0, 0, w, h) end
+		obj.putpixeldata("object", data, w, h)
+	elseif writing then
+		local data = obj.getpixeldata("object")
+		write_pen(data, 0, 0, w0, h0)
+		obj.putpixeldata("object", data, w0, h0)
+	end
+end

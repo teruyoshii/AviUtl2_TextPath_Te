@@ -1,0 +1,17 @@
+TextPath_TeStrokes.txt について
+
+このファイルは KanjiVG を変換したものです。
+KanjiVG
+Copyright (C) 2009-2026 Ulrich Apel
+https://kanjivg.tagaini.net
+
+ライセンス: Creative Commons Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0)
+https://creativecommons.org/licenses/by-sa/3.0/
+
+変更点: 元のXMLから文字コードと画のパスだけを取り出し、1行1文字のテキストに変換しました。
+これは原作者が承認・支持するものではありません。
+
+このファイルは現状のまま提供され、ライセンス本文のとおり、いかなる保証もありません(第5条・第6条)。
+
+TextPath_TeStrokes.txt を再配布・改変して配布する場合は、この表示を残し、同じライセンスの条件で配布してください。
+このライセンスはこのファイルにだけ適用され、同梱のプログラムとスクリプトには適用されません(LICENSE を参照)。
