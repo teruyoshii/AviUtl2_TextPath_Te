@@ -1468,6 +1468,37 @@ void load_settings() {
 	g_move_ctrl = read(L"CtrlScale", 0.1);
 }
 
+// 高度な編集のウィンドウを閉じた時の位置・大きさを保持する
+void save_editor_placement(HWND hwnd) {
+	const std::wstring path = settings_path();
+	WINDOWPLACEMENT wp = { sizeof(wp) };
+	if (path.empty() || !GetWindowPlacement(hwnd, &wp)) return;
+	const RECT& r = wp.rcNormalPosition;
+	auto write = [&](LPCWSTR name, int value) { WritePrivateProfileStringW(L"Window", name, std::to_wstring(value).c_str(), path.c_str()); };
+	write(L"X", r.left);
+	write(L"Y", r.top);
+	write(L"Width", r.right - r.left);
+	write(L"Height", r.bottom - r.top);
+	write(L"Maximized", wp.showCmd == SW_SHOWMAXIMIZED || IsZoomed(hwnd));
+}
+
+// 前に閉じた時の位置・大きさ。無い時・どの画面とも重ならない時はfalse
+bool saved_editor_placement(WINDOWPLACEMENT& wp) {
+	const std::wstring path = settings_path();
+	if (path.empty()) return false;
+	auto read = [&](LPCWSTR name) { return (int)GetPrivateProfileIntW(L"Window", name, 0, path.c_str()); };
+	const int w = read(L"Width"), h = read(L"Height");
+	if (w <= 0 || h <= 0) return false;
+	RECT r = { read(L"X"), read(L"Y") };
+	r.right = r.left + w;
+	r.bottom = r.top + h;
+	if (!MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) return false;
+	wp = { sizeof(wp) };
+	wp.rcNormalPosition = r;
+	wp.showCmd = read(L"Maximized") ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+	return true;
+}
+
 void save_settings() {
 	const std::wstring path = settings_path();
 	if (path.empty()) return;
@@ -3502,6 +3533,7 @@ LRESULT CALLBACK ed_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) 
 		return 0;
 	}
 	case WM_DESTROY:
+		save_editor_placement(hwnd);
 		if (g_ed_hook) { UnhookWindowsHookEx(g_ed_hook); g_ed_hook = nullptr; }
 		KillTimer(hwnd, ED_PREVIEW_TIMER);
 		g_ed.preview_map.reset();
@@ -3596,9 +3628,16 @@ void open_editor(EDIT_SECTION* edit, OBJECT_HANDLE object) {
 	g_ed.hwnd = CreateWindowW(L"TextPath_TeEditor", title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
 		CW_USEDEFAULT, CW_USEDEFAULT, 1140, 760, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
 	if (!g_ed.hwnd) return;
+	// 表示の倍率はウィンドウの大きさで決まるので、位置・大きさを戻してから合わせる
+	WINDOWPLACEMENT placement;
+	const bool restored = saved_editor_placement(placement);
+	if (restored) {
+		placement.showCmd = placement.showCmd == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_HIDE;
+		SetWindowPlacement(g_ed.hwnd, &placement);
+	}
 	ed_fit();
 	EnableWindow(owner, FALSE);	// 編集中は本体を操作できないようにする(OK・キャンセルで戻す)
-	ShowWindow(g_ed.hwnd, SW_SHOW);
+	if (!restored || placement.showCmd != SW_SHOWMAXIMIZED) ShowWindow(g_ed.hwnd, SW_SHOW);
 	SetFocus(g_ed.hwnd);
 	g_ed_hook = SetWindowsHookExW(WH_KEYBOARD, ed_keyboard_hook, nullptr, GetCurrentThreadId());
 }
@@ -4231,7 +4270,7 @@ FILTER_PLUGIN_TABLE g_filter_table = {
 	FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_FILTER,
 	PLUGIN_NAME,
 	L"teruyoshi",
-	L"テキストの輪郭をアンカーで編集できるパスに変換する v1.1 By teruyoshi",
+	L"テキストの輪郭をアンカーで編集できるパスに変換する v1.1.1 By teruyoshi",
 	g_items,
 	proc_video,
 	nullptr, nullptr, nullptr,
@@ -5906,7 +5945,7 @@ EXTERN_C __declspec(dllexport) void InitializeConfig(CONFIG_HANDLE* handle) {
 }
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
-	host->set_plugin_information(L"テキストの輪郭パス化 v1.1 By teruyoshi");
+	host->set_plugin_information(L"テキストの輪郭パス化 v1.1.1 By teruyoshi");
 	g_edit_handle = host->create_edit_handle();
 	host->register_filter_plugin(&g_filter_table);
 	host->register_object_menu(L"輪郭パス\\輪郭を作成・更新", on_object_menu<true>);

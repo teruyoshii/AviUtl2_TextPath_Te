@@ -1,4 +1,4 @@
---information:輪郭パス展開 v1.1 by teruyoshi | 「アイランドごとにオブジェクトへ展開」で作られる、輪郭だけを描くオブジェクト
+--information:輪郭パス展開 v1.1.1 by teruyoshi | 「アイランドごとにオブジェクトへ展開」で作られる、輪郭だけを描くオブジェクト
 --label:teruyoshi
 --color@textColor:文字色,0xffffff
 --check@pen:ペンで書く,false
@@ -75,9 +75,34 @@ if meta[1] == 4 and #place >= 17 then
 	local showPts, showHnd, showMeta, showRaw = pts, hnd, meta, hndRaw
 	if second then showPts, showHnd, showMeta, showRaw = pts2, hnd2, meta2, hndRaw2 end
 	local anchorNum, handleNum = showMeta[9], showMeta[10]
+	-- 描く座標(補間する時は2つの形状の間)
+	local drawPts, drawHnd = pts, hnd
+	if blend and t ~= 0 then
+		drawPts, drawHnd = {}, {}
+		for i = 1, meta[9] * 2 do drawPts[i] = pts[i] + (pts2[i] - pts[i]) * t end
+		for i = 1, meta[10] * 2 do drawHnd[i] = hnd[i] + (hnd2[i] - hnd[i]) * t end
+	end
+	local hasPart = outline.parts(drawPts, drawHnd, meta, 1, -1) > 0
+	local x, y, pw, ph = 0, 0, w0, h0
+	if hasPart then x, y, pw, ph = outline.part_rect(0, ox, oy, w0, h0) end
+	local partX, partY = (x * 2 + pw - w0) / 2, (y * 2 + ph - h0) / 2
+	-- アンカーの基準を、描画の位置に合わせる。
+	-- 文字揃えは中心(obj.cx, obj.cy)、文字毎に個別オブジェクトの文字の位置は相対座標(obj.ox, obj.oy)で表され、スクリプトで設定した値はアンカーの基準に入らない。
+	-- また、描画は部品の位置(obj.ox, obj.oy)を中心に回転・拡大するが、アンカーはオブジェクトの位置を中心に回転・拡大する。
+	-- 部品の位置を回転・拡大の逆変換に通して足すと、同じ位置に揃う(Z軸回転と拡大率のみ。X・Y軸回転には対応しない)
+	local angle = math.rad(obj.getvalue("rz") + obj.rz)
+	local scaleX = obj.getvalue("sx") * obj.sx * obj.zoom
+	local scaleY = obj.getvalue("sy") * obj.sy * obj.zoom
+	local shiftX, shiftY = baseOx + partX, baseOy + partY
+	local localX, localY = shiftX, shiftY
+	if scaleX ~= 0 and scaleY ~= 0 then
+		localX = (shiftX * math.cos(angle) + shiftY * math.sin(angle)) / scaleX
+		localY = (-shiftX * math.sin(angle) + shiftY * math.cos(angle)) / scaleY
+	end
+	local ax, ay = ox - partX + localX - obj.cx, oy - partY + localY - obj.cy
 	local ptsName, hndName = second and "pts2" or "pts", second and "hnd2" or "hnd"
 	-- アンカーの丸の色は変えられないので全てsmallにし、線で見分ける。重なった時に掴めるようにアンカーを先に呼ぶ
-	if anchorNum > 0 then obj.setanchor(ptsName, anchorNum, "small", "offset", ox, oy) end
+	if anchorNum > 0 then obj.setanchor(ptsName, anchorNum, "small", "offset", ax, ay) end
 	if handleNum > 0 and showHandle then
 		-- 詳しくは輪郭パス.anm2を参照: 今のハンドルの位置 + 基準を渡し、数を設定値の数と必ず合わせない
 		local far = 100000
@@ -89,10 +114,10 @@ if meta[1] == 4 and #place >= 17 then
 			positions[num * 2 + 1], positions[num * 2 + 2] = far, far
 			num = num + 1
 		end
-		obj.setanchor(hndName, num, "small", "offset", ox, oy, positions)
+		obj.setanchor(hndName, num, "small", "offset", ax, ay, positions)
 	end
 	if obj.getoption("gui") and (showLine or showHandle) then
-		local outlineLines, arms = outline.lines(showPts, showHnd, showMeta, ox, oy)
+		local outlineLines, arms = outline.lines(showPts, showHnd, showMeta, ax, ay)
 		if showLine then
 			local i = 1
 			while i <= #outlineLines do
@@ -110,16 +135,8 @@ if meta[1] == 4 and #place >= 17 then
 		end
 	end
 
-	-- 描く座標(補間する時は2つの形状の間)
-	local drawPts, drawHnd = pts, hnd
-	if blend and t ~= 0 then
-		drawPts, drawHnd = {}, {}
-		for i = 1, meta[9] * 2 do drawPts[i] = pts[i] + (pts2[i] - pts[i]) * t end
-		for i = 1, meta[10] * 2 do drawHnd[i] = hnd[i] + (hnd2[i] - hnd[i]) * t end
-	end
-	if outline.parts(drawPts, drawHnd, meta, 1, -1) > 0 then
+	if hasPart then
 		local r, g, b = RGB(textColor)
-		local x, y, pw, ph = outline.part_rect(0, ox, oy, w0, h0)
 		obj.clearbuffer("object", pw, ph)
 		local data = obj.getpixeldata("object")
 		-- 切り口の濃さは展開した時の形のものなので、形を動かしていない時だけ使う
@@ -129,7 +146,6 @@ if meta[1] == 4 and #place >= 17 then
 			outline.pen(data, pw, ph, x, y, w0, h0, ox, oy, drawPts, drawHnd, meta, strokes, pts, hnd, obj.effect_id, penT / 100)
 		end
 		obj.putpixeldata("object", data, pw, ph)
-		obj.ox = baseOx + (x * 2 + pw - w0) / 2
-		obj.oy = baseOy + (y * 2 + ph - h0) / 2
+		obj.ox, obj.oy = shiftX, shiftY
 	end
 end

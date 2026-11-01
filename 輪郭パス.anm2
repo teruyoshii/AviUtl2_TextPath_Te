@@ -1,4 +1,4 @@
---information:輪郭パス v1.1 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
+--information:輪郭パス v1.1.1 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
 --label:teruyoshi
 --select@objMode:オブジェクトの分け方=0,全体で1つのオブジェクト=0,文字ごとに個別オブジェクト=1,アイランドごとに個別オブジェクト=2
 --check@pen:ペンで書く,false
