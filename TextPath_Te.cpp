@@ -32,7 +32,7 @@ namespace {
 CONFIG_HANDLE* g_config = nullptr;
 
 const wchar_t* PLUGIN_NAME = L"輪郭生成";
-const wchar_t* PATH_EFFECT = L"輪郭パス";
+const wchar_t* PATH_EFFECT = L"輪郭パス";	// 前方一致で探すので、展開で作るオブジェクトの「輪郭パス展開」も見つかる
 const wchar_t* TEXT_EFFECT = L"テキスト";
 const wchar_t* ITEM_POINTS = L"座標";
 const wchar_t* ITEM_HANDLES = L"ハンドル";
@@ -48,6 +48,8 @@ const wchar_t* ITEM_STROKES = L"筆順";
 const wchar_t* ITEM_MORPH = L"2形状補間";
 const wchar_t* ITEM_MORPH_T = L"補間";
 const wchar_t* ITEM_EXPANDED = L"展開したアイランド";
+const wchar_t* ITEM_PLACE = L"配置";
+const wchar_t* ITEM_SEAM = L"切り口の濃さ";
 const int META_VERSION = 4;
 const double HANDLE_BASE_FAR = 100000;	// ハンドルの配列に入れる基準の点を画面の外へ出す量
 const int META_GLYPH = 8;	// 1文字の項目数: 文字コード, 原点X, 原点Y, 点の数, 輪郭の数, インクの左端, インクの上端, 無編集の座標のハッシュ
@@ -774,7 +776,13 @@ void generate(EDIT_SECTION* edit, OBJECT_HANDLE object, LPCWSTR effect, bool kee
 	if (edit->get_effect_list(object, list.data(), effect_num) != effect_num) return;
 
 	EFFECT_HANDLE text_effect = edit->find_effect(object, TEXT_EFFECT);
-	if (!text_effect) { show_message(L"テキストオブジェクトに追加してください。"); return; }
+	if (!text_effect) {
+		for (EFFECT_HANDLE e : list) {
+			if (wcsncmp(edit->get_effect_name(e), PATH_EFFECT, wcslen(PATH_EFFECT)) == 0 && is_expanded(edit, e)) { show_message(L"アイランドごとに展開したオブジェクトは、輪郭を作り直せません。"); return; }
+		}
+		show_message(L"テキストオブジェクトに追加してください。");
+		return;
+	}
 
 	TextSetting t;
 	t.text = unescape(item_string(edit, text_effect, L"テキスト"));
@@ -3506,11 +3514,10 @@ LRESULT CALLBACK ed_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) 
 	return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
-// 文字が変わっていれば先に更新してから、今の輪郭を読んでウィンドウを開く
+// 文字が変わっていれば先に更新してから、今の輪郭を読んでウィンドウを開く(展開で作ったオブジェクトにはテキストが無いので、更新しない)
 void open_editor(EDIT_SECTION* edit, OBJECT_HANDLE object) {
 	if (g_ed.hwnd) { SetForegroundWindow(g_ed.hwnd); return; }
 	EFFECT_HANDLE text_effect = edit->find_effect(object, TEXT_EFFECT);
-	if (!text_effect) { show_message(L"テキストオブジェクトで使用してください。"); return; }
 	auto find_path = [&]() -> EFFECT_HANDLE {
 		const int num = edit->get_effect_list(object, nullptr, 0);
 		std::vector<EFFECT_HANDLE> list(num);
@@ -3520,8 +3527,12 @@ void open_editor(EDIT_SECTION* edit, OBJECT_HANDLE object) {
 	};
 	auto numbers = [&](EFFECT_HANDLE e, LPCWSTR item) { return parse_numbers(edit->get_effect_item_value(e, item)); };
 	EFFECT_HANDLE path = find_path();
+	// 展開で作るカスタムオブジェクトにはテキストが無いので、比べるものが無い
+	if (!text_effect && !(path && is_expanded(edit, path))) { show_message(L"テキストオブジェクトで使用してください。"); return; }
 	std::vector<double> meta = path ? numbers(path, ITEM_META) : std::vector<double>();
-	if (meta.size() < META_HEADER || meta[0] != META_VERSION || (UINT32)meta[2] != text_setting_hash(edit, text_effect)) {
+	if (!text_effect) {
+		if (meta.size() < META_HEADER || meta[0] != META_VERSION) { show_message(L"編集できる輪郭がありません。"); return; }
+	} else if (meta.size() < META_HEADER || meta[0] != META_VERSION || (UINT32)meta[2] != text_setting_hash(edit, text_effect)) {
 		generate(edit, object, PLUGIN_NAME, true);
 		path = find_path();
 		if (!path) return;
@@ -3935,38 +3946,141 @@ void extract_island(const EdGlyph& glyph, const std::vector<int>& contours, cons
 	meta[META_HEADER + 7] = hash_points(points);
 }
 
-// 自動分割の前後で点は変わるので、塗りで比べる: このアイランドの範囲で、字全体の塗りが無編集の時と同じなら、動かしていない
-bool island_unedited(const std::vector<double>& points, const std::vector<double>& meta, const std::vector<double>& base, const std::vector<double>& base_meta, int g, const std::vector<int>& contours) {
-	if (base.size() < 2 || base_meta.size() < META_HEADER || base_meta[0] != META_VERSION) return false;
-	double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
-	for (const auto* values : { &points, &base }) {
-		for (size_t i = 0; i + 1 < values->size(); i += 2) {
-			x0 = std::min(x0, (*values)[i]); x1 = std::max(x1, (*values)[i]);
-			y0 = std::min(y0, (*values)[i + 1]); y1 = std::max(y1, (*values)[i + 1]);
-		}
+// 元のテキストの画像の中での輪郭の位置。テキストは描画しないと大きさが分からないので、展開の時に描画して輪郭パスから受け取る
+struct PlaceSample {
+	double w, h, base_x, base_y, obj_x, obj_y, center_x, center_y;
+	bool ink;
+};
+std::mutex g_place_mutex;
+bool g_place_recording = false;
+std::map<std::pair<double, int>, PlaceSample> g_place_samples;	// エフェクトのIDと文字の番号(-1なら全体)ごと
+
+struct ExpandRequest {
+	int layer = 0, start = 0, end = 0;
+	double path_id = 0;
+	std::vector<ExpandPart> parts;
+	std::vector<std::string> places;	// 部品ごとの配置の設定値
+	std::vector<std::vector<double>> place_values;
+	std::wstring error;
+	bool failed = false;
+} g_expand;
+
+std::map<std::pair<double, int>, PlaceSample> record_places(int frame) {
+	{
+		std::lock_guard<std::mutex> lock(g_place_mutex);
+		g_place_samples.clear();
+		g_place_recording = true;
 	}
-	const double cx = 3 - std::floor(x0), cy = 3 - std::floor(y0);
-	const int w = (int)std::ceil(x1 + cx) + 3, h = (int)std::ceil(y1 + cy) + 3;
-	const size_t total = (size_t)w * h;
-	std::vector<PIXEL_RGBA> own(total), whole(total), pristine(total);
-	rasterize(own.data(), w, h, points, meta, cx, cy, g, 0, 0, 0, &contours);
-	rasterize(whole.data(), w, h, points, meta, cx, cy, g, 0, 0, 0);
-	rasterize(pristine.data(), w, h, base, base_meta, cx, cy, g, 0, 0, 0);
-	// 分割で点を足した所は僅かに濃さが変わるので、大きく違う画素が数個より多い時だけ動かしたとみなす
-	const int tolerance = 64, allowed = 3;
-	int different = 0;
-	for (size_t i = 0; i < total; i++) {
-		if (own[i].a && std::abs((int)whole[i].a - (int)pristine[i].a) > tolerance && ++different > allowed) return false;
+	if (g_edit_handle->rendering_scene_video(frame, nullptr, [](void*, int, const void*, int, int, int) {})) g_edit_handle->wait_rendering_task();
+	std::lock_guard<std::mutex> lock(g_place_mutex);
+	g_place_recording = false;
+	return g_place_samples;
+}
+
+// 部品ごとの配置を作る。文字毎に個別オブジェクトの時は、文字ごとの値がある
+bool build_places() {
+	const auto first = record_places(g_expand.start);
+	const auto last = g_expand.end != g_expand.start ? record_places(g_expand.end) : first;
+	g_expand.places.clear();
+	g_expand.place_values.clear();
+	for (const ExpandPart& part : g_expand.parts) {
+		const auto key = std::make_pair(g_expand.path_id, part.glyph), whole = std::make_pair(g_expand.path_id, -1);
+		const bool by_glyph = first.count(key) && last.count(key);
+		if (!by_glyph && !(first.count(whole) && last.count(whole))) return false;
+		const PlaceSample& a = first.at(by_glyph ? key : whole);
+		const PlaceSample& b = last.at(by_glyph ? key : whole);
+		std::vector<double> values{ a.ink ? (by_glyph ? 2.0 : 1.0) : 0.0 };
+		for (const PlaceSample* s : { &a, &b }) values.insert(values.end(), { s->w, s->h, s->base_x, s->base_y, s->obj_x, s->obj_y, s->center_x, s->center_y });
+		g_expand.places.push_back(join_numbers(values, "%.4f"));
+		g_expand.place_values.push_back(std::move(values));
 	}
 	return true;
 }
 
-struct ExpandRequest {
-	int layer = 0, start = 0;
-	std::vector<ExpandPart> parts;
-	std::wstring error;
-	bool failed = false;
-} g_expand;
+// 切り口の濃さ: 部品だけの塗りでは切り口の画素が半分ほどの濃さになり、重ねると線が浮かぶ。
+// カスタムオブジェクトは他のアイランドの輪郭を持たないので、字全体の濃さが部品より濃い画素だけを「番号, 濃さ」の並びで持たせる。
+// サイズ等が動く時は画素の格子が毎フレーム変わるので持たない
+std::string build_seam(const std::vector<double>& points, const std::vector<double>& meta, const ExpandPart& part, const std::vector<double>& own_points, const std::vector<double>& place) {
+	if (own_points.size() < 2 || place[1] != place[9] || place[2] != place[10]) return "0";
+	const int w = (int)std::floor(place[1] + 0.5), h = (int)std::floor(place[2] + 0.5);
+	double ox = place[3], oy = place[4];
+	if (place[0] != 0) {
+		size_t head = 0, first = 0, count = 0;
+		if (place[0] == 2 && find_glyph(meta, part.glyph, head, first, count)) { ox -= meta[head + 5]; oy -= meta[head + 6]; }
+		else { ox -= meta[6]; oy -= meta[7]; }
+		ox = std::floor(ox * 2 + 0.5) / 2;
+		oy = std::floor(oy * 2 + 0.5) / 2;
+	}
+	double x0 = own_points[0], x1 = x0, y0 = own_points[1], y1 = y0;
+	for (size_t i = 0; i + 1 < own_points.size(); i += 2) {
+		x0 = std::min(x0, own_points[i]); x1 = std::max(x1, own_points[i]);
+		y0 = std::min(y0, own_points[i + 1]); y1 = std::max(y1, own_points[i + 1]);
+	}
+	// part_rectと同じ計算
+	const int left = (int)std::floor(x0 + w / 2.0 + ox) - 2, top = (int)std::floor(y0 + h / 2.0 + oy) - 2;
+	int pw = (int)std::ceil(x1 + w / 2.0 + ox) + 2 - left, ph = (int)std::ceil(y1 + h / 2.0 + oy) + 2 - top;
+	if ((pw - w) % 2) pw++;
+	if ((ph - h) % 2) ph++;
+	const double cx = w / 2.0 + ox - left, cy = h / 2.0 + oy - top;
+	std::vector<PIXEL_RGBA> own((size_t)pw * ph), whole((size_t)pw * ph);
+	rasterize(own.data(), pw, ph, points, meta, cx, cy, part.glyph, 0, 0, 0, &part.contours);
+	rasterize(whole.data(), pw, ph, points, meta, cx, cy, part.glyph, 0, 0, 0);
+	std::vector<double> seam;
+	for (size_t i = 0; i < own.size(); i++) {
+		if (own[i].a && whole[i].a > own[i].a) { seam.push_back((double)i); seam.push_back(whole[i].a); }
+	}
+	return seam.empty() ? "0" : join_numbers(seam, "%.0f");
+}
+
+// 元のエイリアスから、展開で作るオブジェクトのエイリアスを作る: テキストと輪郭パスを1つのカスタムオブジェクトにまとめ、他のエフェクトと標準描画は残す
+std::string expanded_alias(const std::string& alias) {
+	struct Section { std::string name; std::vector<std::string> lines; };
+	std::vector<std::string> head;
+	std::vector<Section> sections;
+	size_t at = 0;
+	while (at < alias.size()) {
+		size_t end = alias.find('\n', at);
+		if (end == std::string::npos) end = alias.size();
+		std::string line = alias.substr(at, end - at);
+		if (!line.empty() && line.back() == '\r') line.pop_back();
+		at = end + 1;
+		if (line.rfind("[Object.", 0) == 0) { sections.emplace_back(); continue; }
+		if (sections.empty()) { head.push_back(line); continue; }
+		if (line.rfind("effect.name=", 0) == 0) sections.back().name = line.substr(12);
+		else sections.back().lines.push_back(line);
+	}
+	const std::string text_name = u8"テキスト", path_name = u8"輪郭パス", plugin_name = u8"輪郭生成";
+	// 設定値は後から部品ごとに書くので、輪郭のデータと、カスタムオブジェクトに無い項目は除く
+	const char* dropped[] = { u8"オブジェクトの分け方=", u8"輪郭で描画=", u8"座標=", u8"座標2=", u8"ハンドル=", u8"ハンドル2=", u8"輪郭情報=", u8"輪郭情報2=",
+		u8"元の座標=", u8"元の座標2=", u8"元の輪郭情報=", u8"筆順=", u8"展開したアイランド=" };
+	std::string color;
+	std::vector<std::string> path_lines;
+	std::vector<const Section*> others;
+	for (const Section& section : sections) {
+		if (section.name == text_name) {
+			for (const std::string& line : section.lines) if (line.rfind(u8"文字色=", 0) == 0) color = line;
+		} else if (section.name == path_name) {
+			for (const std::string& line : section.lines) {
+				bool drop = false;
+				for (const char* key : dropped) drop = drop || line.rfind(key, 0) == 0;
+				if (!drop) path_lines.push_back(line);
+			}
+		} else if (section.name != plugin_name) {
+			others.push_back(&section);
+		}
+	}
+	std::string out;
+	for (const std::string& line : head) out += line + "\r\n";
+	out += std::string("[Object.0]\r\neffect.name=") + u8"輪郭パス展開" + "\r\n";
+	if (!color.empty()) out += color + "\r\n";
+	for (const std::string& line : path_lines) out += line + "\r\n";
+	int index = 1;
+	for (const Section* section : others) {
+		out += "[Object." + std::to_string(index++) + "]\r\neffect.name=" + section->name + "\r\n";
+		for (const std::string& line : section->lines) out += line + "\r\n";
+	}
+	return out;
+}
 
 // 展開先が空いているかを調べ、部品の一覧を作る
 void expand_read(void*, EDIT_SECTION* edit) {
@@ -3984,6 +4098,8 @@ void expand_read(void*, EDIT_SECTION* edit) {
 	const std::vector<double> meta = parse_numbers(edit->get_effect_item_value(path, ITEM_META));
 	if (meta.size() < META_HEADER || meta[0] != META_VERSION) { g_expand.error = L"先に「輪郭を作成・更新」を押してください。"; return; }
 	if (is_expanded(edit, path)) { g_expand.error = L"このオブジェクトは展開済みです。"; return; }
+	g_expand.end = lf.end;
+	g_expand.path_id = (double)edit->get_effect_id(path);
 	const std::vector<double> anchors = parse_numbers(edit->get_effect_item_value(path, ITEM_POINTS));
 	const std::vector<double> points = merge_points(anchors, resolve_handles(anchors, parse_numbers(edit->get_effect_item_value(path, ITEM_HANDLES)), meta), meta);
 	if (points.empty()) { g_expand.error = L"展開できる輪郭がありません。"; return; }
@@ -4010,7 +4126,7 @@ void expand_write(void*, EDIT_SECTION* edit) {
 	OBJECT_HANDLE object = edit->find_object(g_expand.layer, g_expand.start);
 	if (!object) return;
 	const OBJECT_LAYER_FRAME lf = edit->get_object_layer_frame(object);
-	const std::string alias = edit->get_object_alias(object);
+	const std::string alias = expanded_alias(edit->get_object_alias(object));
 	// 元の輪郭と筆順を読み、各オブジェクトには自分のアイランドの分だけを持たせる
 	EFFECT_HANDLE source = nullptr;
 	{
@@ -4021,14 +4137,14 @@ void expand_write(void*, EDIT_SECTION* edit) {
 	}
 	if (!source) return;
 	auto numbers = [&](LPCWSTR item) { return parse_numbers(edit->get_effect_item_value(source, item)); };
-	const std::vector<double> meta = numbers(ITEM_META), meta2 = numbers(ITEM_META2), base = numbers(ITEM_BASE), base_meta = numbers(ITEM_BASE_META);
+	const std::vector<double> meta = numbers(ITEM_META), meta2 = numbers(ITEM_META2);
 	const std::vector<double> anchors = numbers(ITEM_POINTS), anchors2 = numbers(ITEM_POINTS2);
 	const std::vector<double> points = merge_points(anchors, resolve_handles(anchors, numbers(ITEM_HANDLES), meta), meta);
 	const std::vector<double> points2 = meta2.size() >= META_HEADER && meta2[0] == META_VERSION
 		? merge_points(anchors2, resolve_handles(anchors2, numbers(ITEM_HANDLES2), meta2), meta2) : std::vector<double>();
 	const EdModel model = load_model(points, meta, 0);
 	const EdModel model2 = points2.empty() ? EdModel() : load_model(points2, meta2, 0);
-	struct Extracted { std::vector<double> points, meta, points2, meta2; bool unedited; };
+	struct Extracted { std::vector<double> points, meta, points2, meta2; std::string seam; };
 	std::vector<Extracted> extracted;
 	for (const ExpandPart& part : g_expand.parts) {
 		Extracted x;
@@ -4042,7 +4158,7 @@ void expand_write(void*, EDIT_SECTION* edit) {
 			x.points2 = x.points;
 			x.meta2 = x.meta;
 		}
-		x.unedited = island_unedited(points, meta, base, base_meta, part.glyph, part.contours);
+		x.seam = build_seam(points, meta, part, x.points, g_expand.place_values[extracted.size()]);
 		extracted.push_back(std::move(x));
 	}
 	edit->delete_object(object);
@@ -4057,24 +4173,14 @@ void expand_write(void*, EDIT_SECTION* edit) {
 			if (name.rfind(PATH_EFFECT, 0) == 0) {
 				Extracted& x = extracted[i];
 				edit->set_effect_item_value(e, ITEM_EXPANDED, "1");
-				edit->set_effect_item_value(e, L"オブジェクトの分け方", "全体で1つのオブジェクト");
+				edit->set_effect_item_value(e, ITEM_PLACE, g_expand.places[i].c_str());
+				edit->set_effect_item_value(e, ITEM_SEAM, x.seam.c_str());
 				write_points(edit, e, x.points, x.meta, ITEM_POINTS, ITEM_HANDLES, ITEM_META);
 				write_points(edit, e, x.points2, x.meta2, ITEM_POINTS2, ITEM_HANDLES2, ITEM_META2);
-				// 元の輪郭は、動かしていない画素に本体の画像を使うためのもの。展開前に動かしたアイランドは自前の塗りだけで描く
-				std::vector<double> own_base_meta = x.meta;
-				if (!x.unedited) own_base_meta[8] = own_base_meta[9] = 0;
-				edit->set_effect_item_value(e, ITEM_BASE, x.unedited ? join_numbers(x.points, "%.2f").c_str() : "0,0");
-				edit->set_effect_item_value(e, ITEM_BASE2, x.unedited ? join_numbers(x.points2, "%.2f").c_str() : "0,0");
-				edit->set_effect_item_value(e, ITEM_BASE_META, join_numbers(own_base_meta, "%.10g").c_str());
 				std::vector<GlyphStrokes> own_strokes(1);
 				own_strokes[0].custom = !g_expand.parts[i].lines.empty();
 				own_strokes[0].lines = g_expand.parts[i].lines;
 				edit->set_effect_item_value(e, ITEM_STROKES, join_strokes(own_strokes).c_str());
-			} else if (name == TEXT_EFFECT) {
-				// 本体が文字ごとに分けると、1つのアイランドだけを描けない
-				edit->set_effect_item_value(e, L"文字毎に個別オブジェクト", "0");
-			} else if (name == PLUGIN_NAME) {
-				edit->delete_effect(clone, e);	// 展開したものをさらに展開はしないのでボタンは残さない
 			}
 		}
 		edit->set_object_name(clone, g_expand.parts[i].name.c_str());
@@ -4091,6 +4197,7 @@ void CALLBACK expand_later(HWND, UINT, UINT_PTR id, DWORD) {
 	if (g_expand.parts.size() > 12) text += L"…\n";
 	text += L"\nよろしいですか?";
 	if (MessageBoxW(g_edit_handle->get_host_app_window(), text.c_str(), PLUGIN_NAME, MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+	if (!build_places()) { show_message(L"テキストの位置を確かめられないので展開できません。オブジェクトのレイヤーとエフェクトが有効で、描画されることを確かめてください。"); return; }
 	g_expand.failed = false;
 	g_edit_handle->call_edit_section_param(nullptr, expand_write);
 	if (g_expand.failed) show_message(L"作れなかったオブジェクトがあります。元に戻す(Undo)で展開の前へ戻せます。");
@@ -4124,7 +4231,7 @@ FILTER_PLUGIN_TABLE g_filter_table = {
 	FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_FILTER,
 	PLUGIN_NAME,
 	L"teruyoshi",
-	L"テキストの輪郭をアンカーで編集できるパスに変換する v1.0 By teruyoshi",
+	L"テキストの輪郭をアンカーで編集できるパスに変換する v1.1 By teruyoshi",
 	g_items,
 	proc_video,
 	nullptr, nullptr, nullptr,
@@ -4142,7 +4249,84 @@ std::vector<double> read_array(SCRIPT_MODULE_PARAM* param, int index) {
 	return values;
 }
 
-// fill(data, w, h, アンカー, ハンドル, 輪郭情報, r, g, b, ox, oy, 文字): 輪郭を塗りつぶして画像データへ書く。
+// 入力の内容のハッシュ。座標は小さな変化も見分けるので、丸めずにそのまま混ぜる
+UINT64 hash_mix(UINT64 hash, const void* data, size_t size) {
+	const auto* bytes = static_cast<const unsigned char*>(data);
+	const auto mix = [&](UINT64 value) {
+		hash = (hash ^ value) * 0x9E3779B97F4A7C15ull;
+		hash ^= hash >> 29;
+	};
+	for (; size >= 8; size -= 8, bytes += 8) {
+		UINT64 word;
+		memcpy(&word, bytes, 8);
+		mix(word);
+	}
+	UINT64 rest = size + 1;
+	memcpy(&rest, bytes, size);
+	mix(rest);
+	return hash;
+}
+
+UINT64 hash_mix(UINT64 hash, const std::vector<double>& values) {
+	const UINT64 size = values.size();
+	hash = hash_mix(hash, &size, sizeof(size));
+	return hash_mix(hash, values.data(), values.size() * sizeof(double));
+}
+
+template <typename... Values>
+UINT64 hash_values(UINT64 hash, Values... values) {
+	const double list[] = { (double)values... };
+	return hash_mix(hash, list, sizeof(list));
+}
+
+// 塗り終えた画像を、エフェクト・文字・部品ごとに覚えておく(形が同じなら毎フレーム塗り直さない)。入力のハッシュが違えば使わない
+struct ImageSlot {
+	double id;
+	int glyph, part;
+	bool operator<(const ImageSlot& o) const { return std::tie(id, glyph, part) < std::tie(o.id, o.glyph, o.part); }
+};
+struct CachedImage {
+	UINT64 key = 0, used = 0;
+	std::shared_ptr<const std::vector<PIXEL_RGBA>> pixels;
+};
+std::mutex g_image_mutex;
+std::map<ImageSlot, CachedImage> g_images;
+size_t g_image_bytes = 0;
+UINT64 g_image_clock = 0;
+const size_t IMAGE_CACHE_LIMIT = (size_t)512 * 1024 * 1024;
+
+bool restore_image(const ImageSlot& slot, UINT64 key, PIXEL_RGBA* out, size_t total) {
+	std::shared_ptr<const std::vector<PIXEL_RGBA>> pixels;
+	{
+		std::lock_guard<std::mutex> lock(g_image_mutex);
+		auto found = g_images.find(slot);
+		if (found == g_images.end() || found->second.key != key || found->second.pixels->size() != total) return false;
+		found->second.used = ++g_image_clock;
+		pixels = found->second.pixels;
+	}
+	std::copy(pixels->begin(), pixels->end(), out);
+	return true;
+}
+
+void store_image(const ImageSlot& slot, UINT64 key, const PIXEL_RGBA* data, size_t total) {
+	auto pixels = std::make_shared<const std::vector<PIXEL_RGBA>>(data, data + total);
+	std::lock_guard<std::mutex> lock(g_image_mutex);
+	CachedImage& image = g_images[slot];
+	if (image.pixels) g_image_bytes -= image.pixels->size() * sizeof(PIXEL_RGBA);
+	image.key = key;
+	image.used = ++g_image_clock;
+	image.pixels = std::move(pixels);
+	g_image_bytes += total * sizeof(PIXEL_RGBA);
+	// 上限を超えたら、最も長く使っていないものから消す
+	while (g_image_bytes > IMAGE_CACHE_LIMIT && g_images.size() > 1) {
+		auto oldest = g_images.begin();
+		for (auto it = g_images.begin(); it != g_images.end(); ++it) if (it->second.used < oldest->second.used) oldest = it;
+		g_image_bytes -= oldest->second.pixels->size() * sizeof(PIXEL_RGBA);
+		g_images.erase(oldest);
+	}
+}
+
+// fill(data, w, h, アンカー, ハンドル, 輪郭情報, r, g, b, ox, oy, 文字, エフェクトのID): 輪郭を塗りつぶして画像データへ書く。
 // (ox, oy)は座標の原点の、画像の中心からの位置。文字は番号(0～)で、-1なら全部
 void module_fill(SCRIPT_MODULE_PARAM* param) {
 	auto data = static_cast<PIXEL_RGBA*>(param->get_param_data(0));
@@ -4150,15 +4334,31 @@ void module_fill(SCRIPT_MODULE_PARAM* param) {
 	if (!data || w <= 0 || h <= 0) { param->set_error(u8"引数の値が正しくありません"); return; }
 	const std::vector<double> meta = read_array(param, 5);
 	const std::vector<double> points = merge_points(read_array(param, 3), read_array(param, 4), meta);
-	const double cx = w / 2.0 + param->get_param_double(9), cy = h / 2.0 + param->get_param_double(10);
-	rasterize(data, w, h, points, meta, cx, cy, param->get_param_int(11), param->get_param_int(6), param->get_param_int(7), param->get_param_int(8));
+	const double ox = param->get_param_double(9), oy = param->get_param_double(10);
+	const double cx = w / 2.0 + ox, cy = h / 2.0 + oy;
+	const int only = param->get_param_int(11), r = param->get_param_int(6), g = param->get_param_int(7), b = param->get_param_int(8);
+	const ImageSlot slot{ param->get_param_double(12), only, -1 };
+	const size_t total = (size_t)w * h;
+	const UINT64 key = hash_values(hash_mix(hash_mix(1, points), meta), w, h, ox, oy, r, g, b);
+	if (restore_image(slot, key, data, total)) return;
+	rasterize(data, w, h, points, meta, cx, cy, only, r, g, b);
+	store_image(slot, key, data, total);
+}
+
+// remember_place(エフェクトのID, 文字, 幅, 高さ, 原点X, 原点Y, 標準の位置X, Y, 中心X, Y, インクの位置を含むか): 展開の処理の間だけ記録する
+void module_remember_place(SCRIPT_MODULE_PARAM* param) {
+	std::lock_guard<std::mutex> lock(g_place_mutex);
+	if (!g_place_recording) return;
+	g_place_samples[{ param->get_param_double(0), param->get_param_int(1) }] = PlaceSample{
+		param->get_param_double(2), param->get_param_double(3), param->get_param_double(4), param->get_param_double(5),
+		param->get_param_double(6), param->get_param_double(7), param->get_param_double(8), param->get_param_double(9), param->get_param_boolean(10) };
 }
 
 // 本体の画像の控え。clearbufferで元のデータが無効になるので、capture→clearbuffer→composeの順に使う
 thread_local std::vector<PIXEL_RGBA> g_captured;
-thread_local int g_captured_w = 0, g_captured_h = 0;
+thread_local int g_captured_w = 0, g_captured_h = 0, g_captured_left = 0, g_captured_top = 0;
 
-// capture(data, w, h): 本体の画像を控える
+// capture(data, w, h, x, y): 本体の画像を控える。(x, y)はdataの本体の画像の中での位置(一部だけを切り出した時に使う)
 void module_capture(SCRIPT_MODULE_PARAM* param) {
 	auto data = static_cast<PIXEL_RGBA*>(param->get_param_data(0));
 	const int w = param->get_param_int(1), h = param->get_param_int(2);
@@ -4166,6 +4366,8 @@ void module_capture(SCRIPT_MODULE_PARAM* param) {
 	g_captured.assign(data, data + (size_t)w * h);
 	g_captured_w = w;
 	g_captured_h = h;
+	g_captured_left = param->get_param_int(3);
+	g_captured_top = param->get_param_int(4);
 }
 
 void rasterize(PIXEL_RGBA* out, int w, int h, const std::vector<double>& points, const std::vector<double>& meta, double cx, double cy, int only, int r, int g, int b, const std::vector<int>* contours) {
@@ -4200,7 +4402,7 @@ void rasterize(PIXEL_RGBA* out, int w, int h, const std::vector<double>& points,
 			for (int island : islands) group.push_back(overlap ? group_num + island + 1 : 0);
 			if (overlap) {
 				group_lines.resize(group_num + count);
-				for (int c = 0; c < (int)glyph.contours.size(); c++) {
+				for (int c = 0; !contours && c < (int)glyph.contours.size(); c++) {
 					std::vector<Vec> line = flatten_contour(glyph.contours[c], 0);
 					for (Vec& v : line) { v.x += cx; v.y += cy; }
 					group_lines[group_num + islands[c]].push_back(std::move(line));
@@ -4209,7 +4411,7 @@ void rasterize(PIXEL_RGBA* out, int w, int h, const std::vector<double>& points,
 			}
 		}
 	}
-	auto paint = [&](Rasterizer& raster, int target) {
+	auto each_target_contour = [&](int target, auto func) {
 		int index = -1;
 		size_t order = 0;
 		each_contour_meta(meta, [&](size_t kinds, int seg_num, size_t point) {
@@ -4218,47 +4420,92 @@ void rasterize(PIXEL_RGBA* out, int w, int h, const std::vector<double>& points,
 			order++;
 			if (own != target) return;
 			if (contours && std::find(contours->begin(), contours->end(), index) == contours->end()) return;
-			walk_contour(meta, kinds, seg_num, point, read,
-				[&](Vec a, Vec c1) { raster.line(a, c1); },
-				[&](Vec a, Vec c1, Vec c2, Vec e) { add_curve(raster, a, c1, c2, e); });
+			func(kinds, seg_num, point);
 		}, only);
 	};
+	// (left, top)は塗る範囲の左上。画像全体を塗る時は0
+	auto paint = [&](Rasterizer& raster, int target, int left, int top) {
+		const auto local = [&](Vec v) { return Vec{ v.x - left, v.y - top }; };
+		each_target_contour(target, [&](size_t kinds, int seg_num, size_t point) {
+			walk_contour(meta, kinds, seg_num, point, read,
+				[&](Vec a, Vec c1) { raster.line(local(a), local(c1)); },
+				[&](Vec a, Vec c1, Vec c2, Vec e) { add_curve(raster, local(a), local(c1), local(c2), local(e)); });
+		});
+	};
 	Rasterizer raster(w, h);
-	if (!points.empty()) paint(raster, 0);
+	if (!points.empty()) paint(raster, 0, 0, 0);
 	raster.write(out, r, g, b);
 	if (group_num) {
-		std::vector<PIXEL_RGBA> temp((size_t)w * h);
+		std::vector<PIXEL_RGBA> temp;
 		for (int target = 1; target <= group_num; target++) {
-			Rasterizer separate(w, h);
-			paint(separate, target);
+			// 組ごとの塗りは、その組の点が収まる範囲だけで行う(曲線は制御点の範囲に収まる)
+			bool any = false;
+			double min_x = 0, min_y = 0, max_x = 0, max_y = 0;
+			const auto include = [&](Vec v) {
+				if (!any) { min_x = max_x = v.x; min_y = max_y = v.y; any = true; return; }
+				min_x = std::min(min_x, v.x); max_x = std::max(max_x, v.x);
+				min_y = std::min(min_y, v.y); max_y = std::max(max_y, v.y);
+			};
+			each_target_contour(target, [&](size_t kinds, int seg_num, size_t point) {
+				walk_contour(meta, kinds, seg_num, point, read,
+					[&](Vec a, Vec c1) { include(a); include(c1); },
+					[&](Vec a, Vec c1, Vec c2, Vec e) { include(a); include(c1); include(c2); include(e); });
+			});
+			if (!any) continue;
+			const int left = std::clamp((int)std::floor(min_x) - 1, 0, w), right = std::clamp((int)std::ceil(max_x) + 2, 0, w);
+			const int top = std::clamp((int)std::floor(min_y) - 1, 0, h), bottom = std::clamp((int)std::ceil(max_y) + 2, 0, h);
+			const int box_w = right - left, box_h = bottom - top;
+			if (box_w <= 0 || box_h <= 0) continue;
+			temp.resize((size_t)box_w * box_h);
+			Rasterizer separate(box_w, box_h);
+			paint(separate, target, left, top);
 			separate.write(temp.data(), r, g, b);
-			for (size_t i = 0; i < temp.size(); i++) out[i].a = std::max(out[i].a, temp[i].a);
+			for (int y = 0; y < box_h; y++) {
+				PIXEL_RGBA* row = out + (size_t)(y + top) * w + left;
+				const PIXEL_RGBA* from = temp.data() + (size_t)y * box_w;
+				for (int x = 0; x < box_w; x++) row[x].a = std::max(row[x].a, from[x].a);
+			}
 		}
 		// 切り口の上の画素は2つの組が半分ずつ覆うので、濃い方を取ると薄くなる(黒い線が浮かぶ)。
 		// 足すと、同じ辺を共有する行が濃くなる。そこで、足した時と違う画素だけ、点を細かく調べて実際に覆われている割合を求める
 		if (!contours) {
+			temp.resize((size_t)w * h);
 			Rasterizer joint(w, h);
-			for (int target = 1; target <= group_num; target++) paint(joint, target);
+			for (int target = 1; target <= group_num; target++) paint(joint, target, 0, 0);
 			joint.write(temp.data(), r, g, b);
 			const int samples = 6;
-			auto covered = [&](double x, double y) {
-				for (const auto& lines : group_lines) {
-					int winding = 0;
-					for (const auto& line : lines) {
+			// 調べる画素のある行を通る辺だけを、組ごとに持っておく
+			struct Edge { Vec a, c; };
+			std::vector<std::vector<Edge>> row_edges(group_lines.size());
+			auto load_row = [&](int y) {
+				for (size_t k = 0; k < group_lines.size(); k++) {
+					row_edges[k].clear();
+					for (const auto& line : group_lines[k]) {
 						for (size_t i = 0; i < line.size(); i++) {
 							const Vec a = line[i], c = line[(i + 1) % line.size()];
-							if ((a.y <= y) == (c.y <= y)) continue;
-							if (x < a.x + (c.x - a.x) * (y - a.y) / (c.y - a.y)) winding += a.y < c.y ? 1 : -1;
+							if (std::min(a.y, c.y) < y + 1 && std::max(a.y, c.y) > y) row_edges[k].push_back({ a, c });
 						}
+					}
+				}
+			};
+			auto covered = [&](double x, double y) {
+				for (const auto& edges : row_edges) {
+					int winding = 0;
+					for (const Edge& edge : edges) {
+						const Vec a = edge.a, c = edge.c;
+						if ((a.y <= y) == (c.y <= y)) continue;
+						if (x < a.x + (c.x - a.x) * (y - a.y) / (c.y - a.y)) winding += a.y < c.y ? 1 : -1;
 					}
 					if (winding) return true;
 				}
 				return false;
 			};
 			for (int y = 0; y < h; y++) {
+				bool loaded = false;
 				for (int x = 0; x < w; x++) {
 					const size_t at = (size_t)y * w + x;
 					if ((int)temp[at].a - (int)out[at].a <= 2) continue;
+					if (!loaded) { load_row(y); loaded = true; }
 					int inside = 0;
 					for (int sy = 0; sy < samples; sy++) {
 						for (int sx = 0; sx < samples; sx++) {
@@ -4272,7 +4519,7 @@ void rasterize(PIXEL_RGBA* out, int w, int h, const std::vector<double>& points,
 	}
 }
 
-// compose(data, w, h, アンカー, ハンドル, 輪郭情報, 元の座標, 元の輪郭情報, r, g, b, ox, oy, 文字):
+// compose(data, w, h, アンカー, ハンドル, 輪郭情報, 元の座標, 元の輪郭情報, r, g, b, ox, oy, 文字, エフェクトのID):
 // 輪郭を塗り、無編集の輪郭と塗りが同じ画素は控えた本体の画像のまま残す(動かしていない部分は画が変わらない)
 // 点の追加・削除で構造が変わっても比べられるように、無編集の輪郭は元の構造で塗る
 void module_compose(SCRIPT_MODULE_PARAM* param) {
@@ -4283,10 +4530,16 @@ void module_compose(SCRIPT_MODULE_PARAM* param) {
 	const std::vector<double> points = merge_points(read_array(param, 3), read_array(param, 4), meta);
 	const std::vector<double> base = read_array(param, 6);
 	const std::vector<double> base_meta = read_array(param, 7);
-	const double cx = w / 2.0 + param->get_param_double(11), cy = h / 2.0 + param->get_param_double(12);
-	const int only = param->get_param_int(13);
-	rasterize(data, w, h, points, meta, cx, cy, only, param->get_param_int(8), param->get_param_int(9), param->get_param_int(10));
-	if (g_captured.empty()) return;
+	const double ox = param->get_param_double(11), oy = param->get_param_double(12);
+	const double cx = w / 2.0 + ox, cy = h / 2.0 + oy;
+	const int only = param->get_param_int(13), r = param->get_param_int(8), g = param->get_param_int(9), b = param->get_param_int(10);
+	const ImageSlot slot{ param->get_param_double(14), only, -1 };
+	const size_t total = (size_t)w * h;
+	UINT64 key = hash_values(hash_mix(hash_mix(hash_mix(hash_mix(2, points), meta), base), base_meta), w, h, ox, oy, r, g, b, g_captured_w, g_captured_h);
+	key = hash_mix(key, g_captured.data(), g_captured.size() * sizeof(PIXEL_RGBA));
+	if (restore_image(slot, key, data, total)) return;
+	rasterize(data, w, h, points, meta, cx, cy, only, r, g, b);
+	if (g_captured.empty()) { store_image(slot, key, data, total); return; }
 	std::vector<PIXEL_RGBA> pristine((size_t)w * h);
 	rasterize(pristine.data(), w, h, base, base_meta, cx, cy, only, 0, 0, 0);
 	// 保存時の丸めで生じる僅かな差は同じとみなす
@@ -4301,6 +4554,7 @@ void module_compose(SCRIPT_MODULE_PARAM* param) {
 			else p.a = 0;
 		}
 	}
+	store_image(slot, key, data, total);
 }
 
 // 個別オブジェクトに分ける単位。1つの文字の中の輪郭の組
@@ -4311,6 +4565,19 @@ struct Part {
 thread_local std::vector<Part> g_parts;
 thread_local std::vector<double> g_part_points, g_part_meta;
 
+// 1回の描画の部品に共通するもの(partsの後の最初のcompose_partで作る)
+struct GlyphLayers {
+	int left = 0, top = 0, w = 0, h = 0;
+	std::vector<PIXEL_RGBA> whole, pristine;	// 字全体の塗りと無編集の塗り
+};
+struct PartFrame {
+	bool ready = false;
+	UINT64 key = 0;
+	std::vector<double> base, base_meta;
+	std::map<int, GlyphLayers> layers;
+};
+thread_local PartFrame g_part_frame;
+
 // parts(アンカー, ハンドル, 輪郭情報, 分け方, 文字): 個別オブジェクトの数を返す。分け方は1=文字ごと / 2=アイランドごと。
 // 文字は番号(0～)で、-1なら全部。空白は数えない。結果はpart_rect・compose_partで使う
 void module_parts(SCRIPT_MODULE_PARAM* param) {
@@ -4318,6 +4585,7 @@ void module_parts(SCRIPT_MODULE_PARAM* param) {
 	g_part_points = merge_points(read_array(param, 0), read_array(param, 1), g_part_meta);
 	const int mode = param->get_param_int(3), only = param->get_param_int(4);
 	g_parts.clear();
+	g_part_frame = PartFrame();
 	if (!g_part_points.empty()) {
 		const EdModel model = load_model(g_part_points, g_part_meta, 0);
 		for (int g = 0; g < (int)model.size(); g++) {
@@ -4367,7 +4635,38 @@ void module_part_rect(SCRIPT_MODULE_PARAM* param) {
 	param->push_result_int(ph);
 }
 
-// compose_part(data, 番号, 元の座標, 元の輪郭情報, r, g, b, ox, oy, x, y, w, h, pw, ph, 縁の濃さの上限): 個別オブジェクトの画像を作る。
+// その字の全ての点が収まる範囲で、字全体の塗りと無編集の塗りを1回だけ作る。部品はここから自分の範囲を読む
+const GlyphLayers& glyph_layers(int glyph, int w, int h, double ox, double oy) {
+	auto found = g_part_frame.layers.find(glyph);
+	if (found != g_part_frame.layers.end()) return found->second;
+	GlyphLayers& layers = g_part_frame.layers[glyph];
+	double x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+	bool any = false;
+	each_contour_meta(g_part_meta, [&](size_t kinds, int seg_num, size_t point) {
+		size_t used = 1;
+		for (int s = 0; s < seg_num; s++) used += seg_size(g_part_meta[kinds + s]);
+		for (size_t i = point; i < point + used; i++) {
+			const double x = g_part_points[i * 2], y = g_part_points[i * 2 + 1];
+			if (!any) { x0 = x1 = x; y0 = y1 = y; any = true; }
+			x0 = std::min(x0, x); x1 = std::max(x1, x);
+			y0 = std::min(y0, y); y1 = std::max(y1, y);
+		}
+	}, glyph);
+	// part_rectと同じ計算で、偶奇を揃えて1増えた分も含める
+	layers.left = (int)std::floor(x0 + w / 2.0 + ox) - 2;
+	layers.top = (int)std::floor(y0 + h / 2.0 + oy) - 2;
+	layers.w = (int)std::ceil(x1 + w / 2.0 + ox) + 3 - layers.left;
+	layers.h = (int)std::ceil(y1 + h / 2.0 + oy) + 3 - layers.top;
+	const double cx = w / 2.0 + ox - layers.left, cy = h / 2.0 + oy - layers.top;
+	const size_t total = (size_t)layers.w * layers.h;
+	layers.whole.resize(total);
+	layers.pristine.resize(total);
+	rasterize(layers.whole.data(), layers.w, layers.h, g_part_points, g_part_meta, cx, cy, glyph, 0, 0, 0);
+	rasterize(layers.pristine.data(), layers.w, layers.h, g_part_frame.base, g_part_frame.base_meta, cx, cy, glyph, 0, 0, 0);
+	return layers;
+}
+
+// compose_part(data, 番号, 元の座標, 元の輪郭情報, r, g, b, ox, oy, x, y, w, h, pw, ph, 縁の濃さの上限, エフェクトのID, 切り口の濃さ): 個別オブジェクトの画像を作る。
 // 元の座標があれば、動かしていない部分は控えた本体の画像のまま残す。他の個別オブジェクトと共有する画素はその輪郭の塗りで分ける
 void module_compose_part(SCRIPT_MODULE_PARAM* param) {
 	auto data = static_cast<PIXEL_RGBA*>(param->get_param_data(0));
@@ -4375,32 +4674,51 @@ void module_compose_part(SCRIPT_MODULE_PARAM* param) {
 	const int w = param->get_param_int(11), h = param->get_param_int(12), pw = param->get_param_int(13), ph = param->get_param_int(14);
 	if (!data || pw <= 0 || ph <= 0 || index < 0 || index >= (int)g_parts.size()) { param->set_error(u8"引数の値が正しくありません"); return; }
 	const Part& part = g_parts[index];
-	const std::vector<double> base = read_array(param, 2);
-	const std::vector<double> base_meta = read_array(param, 3);
-	const int left = param->get_param_int(9), top = param->get_param_int(10), fringe_limit = param->get_param_int(15);
-	const double cx = w / 2.0 + param->get_param_double(7) - left, cy = h / 2.0 + param->get_param_double(8) - top;
-	const size_t total = (size_t)pw * ph;
-	std::vector<PIXEL_RGBA> whole(total), pristine;
-	rasterize(data, pw, ph, g_part_points, g_part_meta, cx, cy, part.glyph, param->get_param_int(4), param->get_param_int(5), param->get_param_int(6), &part.contours);
-	rasterize(whole.data(), pw, ph, g_part_points, g_part_meta, cx, cy, part.glyph, 0, 0, 0);
-	const bool use_base = !base.empty() && !g_captured.empty();
-	if (use_base) {
-		pristine.resize(total);
-		rasterize(pristine.data(), pw, ph, base, base_meta, cx, cy, part.glyph, 0, 0, 0);
+	const double ox = param->get_param_double(7), oy = param->get_param_double(8);
+	PartFrame& frame = g_part_frame;
+	if (!frame.ready) {
+		frame.base = read_array(param, 2);
+		frame.base_meta = read_array(param, 3);
+		frame.key = hash_mix(hash_mix(hash_mix(hash_mix(3, g_part_points), g_part_meta), frame.base), frame.base_meta);
+		frame.key = hash_values(frame.key, w, h, ox, oy, g_captured_w, g_captured_h);
+		frame.ready = true;
 	}
+	const int left = param->get_param_int(9), top = param->get_param_int(10), fringe_limit = param->get_param_int(15);
+	const int r = param->get_param_int(4), g = param->get_param_int(5), b = param->get_param_int(6);
+	const double cx = w / 2.0 + ox - left, cy = h / 2.0 + oy - top;
+	const size_t total = (size_t)pw * ph;
+	const ImageSlot slot{ param->get_param_double(16), part.glyph, index };
+	const std::vector<double> seam = read_array(param, 17);
+	UINT64 key = hash_mix(hash_values(frame.key, left, top, pw, ph, r, g, b, fringe_limit), seam);
+	// 本体の画像は、この部品の範囲だけを読むので、その範囲だけを比べる
+	if (!frame.base.empty()) {
+		const int from_x = std::clamp(left - g_captured_left, 0, g_captured_w), to_x = std::clamp(left - g_captured_left + pw, 0, g_captured_w);
+		const int from_y = std::clamp(top - g_captured_top, 0, g_captured_h), to_y = std::clamp(top - g_captured_top + ph, 0, g_captured_h);
+		for (int y = from_y; y < to_y && from_x < to_x; y++) key = hash_mix(key, g_captured.data() + (size_t)y * g_captured_w + from_x, (size_t)(to_x - from_x) * sizeof(PIXEL_RGBA));
+	}
+	if (restore_image(slot, key, data, total)) return;
+	rasterize(data, pw, ph, g_part_points, g_part_meta, cx, cy, part.glyph, r, g, b, &part.contours);
+	for (size_t i = 0; i + 1 < seam.size(); i += 2) {
+		const size_t at = (size_t)seam[i];
+		if (at < total) data[at].a = (unsigned char)seam[i + 1];
+	}
+	if (frame.base.empty() || g_captured.empty()) { store_image(slot, key, data, total); return; }
+	const GlyphLayers& layers = glyph_layers(part.glyph, w, h, ox, oy);
 	const int tolerance = 8;
 	const std::vector<PIXEL_RGBA> own(data, data + total);
-	for (int y = 0; use_base && y < ph; y++) {
+	for (int y = 0; y < ph; y++) {
 		for (int x = 0; x < pw; x++) {
 			const size_t at = (size_t)y * pw + x;
-			if (std::abs((int)whole[at].a - (int)pristine[at].a) > tolerance) continue;
-			const int sx = x + left, sy = y + top;
+			const size_t at_layer = (size_t)(y + top - layers.top) * layers.w + (x + left - layers.left);
+			const PIXEL_RGBA& whole_pixel = layers.whole[at_layer];
+			if (std::abs((int)whole_pixel.a - (int)layers.pristine[at_layer].a) > tolerance) continue;
+			const int sx = x + left - g_captured_left, sy = y + top - g_captured_top;
 			if (sx < 0 || sx >= g_captured_w || sy < 0 || sy >= g_captured_h) continue;
 			const PIXEL_RGBA& body = g_captured[(size_t)sy * g_captured_w + sx];
 			if (own[at].a) {
 				// 切り口の画素も字全体の濃さにする(半分ずつの2枚を重ねると切り目が薄くなる)
 				data[at] = body;
-			} else if (!whole[at].a && body.a && body.a <= fringe_limit) {
+			} else if (!whole_pixel.a && body.a && body.a <= fringe_limit) {
 				// 自前の塗りには入らない本体の縁は、隣がこの個別オブジェクトなら残す。
 				// 展開したオブジェクトは他のアイランドの輪郭を持たないので、隣のアイランドの濃い画素を上限で除く
 				bool beside = false;
@@ -4414,6 +4732,7 @@ void module_compose_part(SCRIPT_MODULE_PARAM* param) {
 			}
 		}
 	}
+	store_image(slot, key, data, total);
 }
 
 //---------------------------------------------------------------------
@@ -5563,6 +5882,7 @@ void module_lines(SCRIPT_MODULE_PARAM* param) {
 SCRIPT_MODULE_FUNCTION g_functions[] = {
 	{ L"fill", module_fill },
 	{ L"capture", module_capture },
+	{ L"remember_place", module_remember_place },
 	{ L"compose", module_compose },
 	{ L"parts", module_parts },
 	{ L"part_rect", module_part_rect },
@@ -5586,7 +5906,7 @@ EXTERN_C __declspec(dllexport) void InitializeConfig(CONFIG_HANDLE* handle) {
 }
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
-	host->set_plugin_information(L"テキストの輪郭パス化 v1.0 By teruyoshi");
+	host->set_plugin_information(L"テキストの輪郭パス化 v1.1 By teruyoshi");
 	g_edit_handle = host->create_edit_handle();
 	host->register_filter_plugin(&g_filter_table);
 	host->register_object_menu(L"輪郭パス\\輪郭を作成・更新", on_object_menu<true>);

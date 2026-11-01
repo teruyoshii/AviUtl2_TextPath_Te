@@ -1,4 +1,4 @@
---information:輪郭パス v1.0 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
+--information:輪郭パス v1.1 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
 --label:teruyoshi
 --select@objMode:オブジェクトの分け方=0,全体で1つのオブジェクト=0,文字ごとに個別オブジェクト=1,アイランドごとに個別オブジェクト=2
 --check@pen:ペンで書く,false
@@ -108,6 +108,8 @@ if meta[1] == 4 then
 		end
 	end
 	local ox, oy = cache.x, cache.y
+	-- 展開で作るオブジェクトの配置に使う(展開の処理の間だけ記録される)
+	outline.remember_place(obj.effect_id, glyph, w0, h0, cache.ink and ox + inkLeft or ox, cache.ink and oy + inkTop or oy, obj.ox, obj.oy, obj.cx, obj.cy, cache.ink and true or false)
 
 	-- 表示・編集する形状
 	local second = blend and editShape == 1
@@ -214,13 +216,25 @@ if meta[1] == 4 then
 				for i = 1, #base do drawBase[i] = base[i] + (base2[i] - base[i]) * t end
 			end
 		end
-		if drawBase or split or expanded then outline.capture(obj.getpixeldata("object"), w0, h0) end
+		if (drawBase or split) and not expanded then outline.capture(obj.getpixeldata("object"), w0, h0, 0, 0) end
 		if expanded then
 			if outline.parts(drawPts, drawHnd, meta, 1, glyph) > 0 then
 				local x, y, pw, ph = outline.part_rect(0, ox, oy, w0, h0)
+				-- 本体の画像は部品の範囲だけを使うので、切り出して小さくしてから読む(字全体を読むより速い)
+				local cropX, cropY = math.max(x, 0), math.max(y, 0)
+				local cropW, cropH = math.min(x + pw, w0) - cropX, math.min(y + ph, h0) - cropY
+				local baseOx, baseOy = obj.ox, obj.oy
+				if drawBase and cropW > 0 and cropH > 0 then
+					obj.copybuffer("tempbuffer", "object")
+					obj.load("tempbuffer", cropX, cropY, cropW, cropH)
+					outline.capture(obj.getpixeldata("object"), cropW, cropH, cropX, cropY)
+				elseif drawBase then
+					drawBase = nil
+				end
+				obj.ox, obj.oy = baseOx, baseOy
 				obj.clearbuffer("object", pw, ph)
 				local data = obj.getpixeldata("object")
-				outline.compose_part(data, 0, drawBase or {}, baseMeta, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 64)
+				outline.compose_part(data, 0, drawBase or {}, baseMeta, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 64, obj.effect_id)
 				if writing then write_pen(data, x, y, pw, ph) end
 				obj.putpixeldata("object", data, pw, ph)
 				obj.ox = obj.ox + (x * 2 + pw - w0) / 2
@@ -243,7 +257,7 @@ if meta[1] == 4 then
 					local x, y, pw, ph = outline.part_rect(part, ox, oy, w0, h0)
 					obj.clearbuffer("object", pw, ph)
 					local data = obj.getpixeldata("object")
-					outline.compose_part(data, part, drawBase or {}, baseMeta, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 255)
+					outline.compose_part(data, part, drawBase or {}, baseMeta, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 255, obj.effect_id)
 					if writing then write_pen(data, x, y, pw, ph) end
 					obj.putpixeldata("object", data, pw, ph)
 					obj.ox = ox0 + (x * 2 + pw - w0) / 2
@@ -260,9 +274,9 @@ if meta[1] == 4 then
 		obj.clearbuffer("object", w, h)
 		local data = obj.getpixeldata("object")
 		if drawBase then
-			outline.compose(data, w, h, drawPts, drawHnd, meta, drawBase, baseMeta, r, g, b, ox, oy, glyph)
+			outline.compose(data, w, h, drawPts, drawHnd, meta, drawBase, baseMeta, r, g, b, ox, oy, glyph, obj.effect_id)
 		else
-			outline.fill(data, w, h, drawPts, drawHnd, meta, r, g, b, ox, oy, glyph)
+			outline.fill(data, w, h, drawPts, drawHnd, meta, r, g, b, ox, oy, glyph, obj.effect_id)
 		end
 		-- 画像を広げても中心は同じなので、全体の大きさを今の大きさとして渡す
 		w0, h0 = w, h

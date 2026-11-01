@@ -1,0 +1,135 @@
+--information:輪郭パス展開 v1.1 by teruyoshi | 「アイランドごとにオブジェクトへ展開」で作られる、輪郭だけを描くオブジェクト
+--label:teruyoshi
+--color@textColor:文字色,0xffffff
+--check@pen:ペンで書く,false
+--track@penT:書き進み,0,100,100,0.01
+--check@showHandle:ハンドルを表示,true
+--check@showLine:輪郭線を表示,true
+--color@lineColor:輪郭線の色,0x40c0ff
+--color@armColor:ハンドルの線の色,0xff9040
+--check@morph:2形状補間,false
+--track@morphT:補間,0,100,0,0.01
+--select@editShape:編集する形状=0,形状1=0,形状2=1
+--value@pts2:座標2,{0,0}
+--value@hnd2:ハンドル2,{0,0}
+--value@pts:座標,{0,0}
+--value@hnd:ハンドル,{0,0}
+--value@meta:輪郭情報,{0}
+--value@meta2:輪郭情報2,{0}
+--value@strokes:筆順,{0}
+--value@expandPart:展開したアイランド,{0}
+--value@place:配置,{0}
+--value@seam:切り口の濃さ,{0}
+--hide@penT:pen==0
+--hide@morphT:morph==0
+--hide@editShape:morph==0
+--hide@pts2:morph==0
+--hide@hnd2:morph==0
+--hide@pts
+--hide@hnd
+--hide@meta
+--hide@meta2
+--hide@strokes
+--hide@expandPart
+--hide@place
+--hide@seam
+
+local outline = obj.module("TextPath_Te")
+
+if meta[1] == 4 and #place >= 17 then
+	-- ハンドルは持ち主のアンカーに追従する
+	local hndRaw, hndRaw2 = hnd, hnd2
+	hnd = outline.handles(pts, hndRaw, meta)
+	if meta2[1] == 4 then hnd2 = outline.handles(pts2, hndRaw2, meta2) end
+
+	-- 2形状補間(形状の点の並びが同じ時だけ)
+	local blend = morph and meta2[1] == 4 and meta2[9] == meta[9] and meta2[10] == meta[10]
+	local t = blend and morphT / 100 or 0
+
+	-- 配置: 展開の時に元のテキストの先頭と末尾のフレームで記録した値。サイズ等が動いていた時は間を補間する
+	-- [1]はインクの位置の取り方(0=使わない / 1=全体の値 / 2=文字の値)、[2]以降は幅, 高さ, 原点X, 原点Y, 標準の位置X, Y, 中心X, Y を2組
+	local k = obj.totalframe > 1 and obj.frame / (obj.totalframe - 1) or 0
+	local function at(i) return place[1 + i] + (place[9 + i] - place[1 + i]) * k end
+	local w0, h0 = math.floor(at(1) + 0.5), math.floor(at(2) + 0.5)
+	local ox, oy = at(3), at(4)
+	if place[1] ~= 0 then
+		local function ink_of(m)
+			if place[1] == 2 then return outline.glyph_ink(m, 0) end
+			return m[7], m[8]
+		end
+		local inkLeft, inkTop = ink_of(meta)
+		if blend then
+			local l2, t2 = ink_of(meta2)
+			inkLeft, inkTop = inkLeft + (l2 - inkLeft) * t, inkTop + (t2 - inkTop) * t
+		end
+		-- 輪郭パス.anm2と同じく0.5刻みにする
+		ox = math.floor((ox - inkLeft) * 2 + 0.5) / 2
+		oy = math.floor((oy - inkTop) * 2 + 0.5) / 2
+	end
+	local baseOx, baseOy = at(5), at(6)
+	obj.ox, obj.oy = baseOx, baseOy
+	obj.cx, obj.cy = at(7), at(8)
+
+	-- 表示・編集する形状
+	local second = blend and editShape == 1
+	local showPts, showHnd, showMeta, showRaw = pts, hnd, meta, hndRaw
+	if second then showPts, showHnd, showMeta, showRaw = pts2, hnd2, meta2, hndRaw2 end
+	local anchorNum, handleNum = showMeta[9], showMeta[10]
+	local ptsName, hndName = second and "pts2" or "pts", second and "hnd2" or "hnd"
+	-- アンカーの丸の色は変えられないので全てsmallにし、線で見分ける。重なった時に掴めるようにアンカーを先に呼ぶ
+	if anchorNum > 0 then obj.setanchor(ptsName, anchorNum, "small", "offset", ox, oy) end
+	if handleNum > 0 and showHandle then
+		-- 詳しくは輪郭パス.anm2を参照: 今のハンドルの位置 + 基準を渡し、数を設定値の数と必ず合わせない
+		local far = 100000
+		local positions = {}
+		for i = 1, handleNum * 2 do positions[i] = showHnd[i] end
+		for i = 1, anchorNum * 2 do positions[handleNum * 2 + i] = showPts[i] + far end
+		local num = handleNum + anchorNum
+		if #showRaw / 2 == num then
+			positions[num * 2 + 1], positions[num * 2 + 2] = far, far
+			num = num + 1
+		end
+		obj.setanchor(hndName, num, "small", "offset", ox, oy, positions)
+	end
+	if obj.getoption("gui") and (showLine or showHandle) then
+		local outlineLines, arms = outline.lines(showPts, showHnd, showMeta, ox, oy)
+		if showLine then
+			local i = 1
+			while i <= #outlineLines do
+				local count = outlineLines[i]
+				local tbl = {}
+				for n = 1, count * 2 do tbl[n] = outlineLines[i + n] end
+				obj.setanchor(tbl, count, "line", "color", lineColor)
+				i = i + count * 2 + 1
+			end
+		end
+		if showHandle then
+			for i = 1, #arms, 4 do
+				obj.setanchor({ arms[i], arms[i + 1], arms[i + 2], arms[i + 3] }, 2, "line", "color", armColor)
+			end
+		end
+	end
+
+	-- 描く座標(補間する時は2つの形状の間)
+	local drawPts, drawHnd = pts, hnd
+	if blend and t ~= 0 then
+		drawPts, drawHnd = {}, {}
+		for i = 1, meta[9] * 2 do drawPts[i] = pts[i] + (pts2[i] - pts[i]) * t end
+		for i = 1, meta[10] * 2 do drawHnd[i] = hnd[i] + (hnd2[i] - hnd[i]) * t end
+	end
+	if outline.parts(drawPts, drawHnd, meta, 1, -1) > 0 then
+		local r, g, b = RGB(textColor)
+		local x, y, pw, ph = outline.part_rect(0, ox, oy, w0, h0)
+		obj.clearbuffer("object", pw, ph)
+		local data = obj.getpixeldata("object")
+		-- 切り口の濃さは展開した時の形のものなので、形を動かしていない時だけ使う
+		local useSeam = not (blend and t ~= 0) and not outline.edited(pts, hnd, meta, -1)
+		outline.compose_part(data, 0, {}, { 0 }, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 64, obj.effect_id, useSeam and seam or {})
+		if pen and penT < 100 then
+			outline.pen(data, pw, ph, x, y, w0, h0, ox, oy, drawPts, drawHnd, meta, strokes, pts, hnd, obj.effect_id, penT / 100)
+		end
+		obj.putpixeldata("object", data, pw, ph)
+		obj.ox = baseOx + (x * 2 + pw - w0) / 2
+		obj.oy = baseOy + (y * 2 + ph - h0) / 2
+	end
+end
