@@ -67,6 +67,7 @@ struct Contour {
 
 struct Glyph {
 	UINT32 code = 0;
+	double size = 0;	// 制御文字<s>で変えた後の文字の大きさ
 	Vec origin{ 0, 0 };
 	std::vector<Contour> contours;
 	int point_count() const {
@@ -191,7 +192,33 @@ struct TextSetting {
 	UINT32 hash = 0;
 };
 
+// 制御文字の数値。符号が付いていれば相対の指定。空ならfalse
+bool parse_control_number(const std::wstring& s, double& value, bool& relative) {
+	if (s.empty()) return false;
+	wchar_t* end = nullptr;
+	value = wcstod(s.c_str(), &end);
+	if (end != s.c_str() + s.size()) throw std::wstring(L"制御文字の数値「" + s + L"」を読めません。");
+	relative = s[0] == L'+' || s[0] == L'-';
+	return true;
+}
+
+std::vector<std::wstring> split_control(const std::wstring& s) {
+	std::vector<std::wstring> parts(1);
+	for (wchar_t c : s) {
+		if (c == L',') parts.emplace_back();
+		else parts.back() += c;
+	}
+	return parts;
+}
+
 // 文字を並べて輪郭を作る。座標の原点は行の左上。本体の画像の大きさ・余白は文字の内容でも変わるので、描画時に画像のインクの位置で合わせる
+// 制御文字は<p>(座標)と<s>(文字の大きさ)だけ扱う。並べ方は本体の描画を実機で測って合わせた:
+// - 文字の位置 = ペンの位置 + ずれ。ペンは字幅と字間だけ進み、<p+X,+Y>はずれに足す(重ねると累積)。<p>はずれを0に戻す
+// - <pX,Y>はペンの位置をX、行の上端をY(文字列の左上が基準)にして、その向きのずれを0にする
+// - 改行で、行の上端は「Yのずれ + その行で一番大きい文字の行の高さ + 行間」だけ進み、ペンとXのずれは0に戻る
+// - 1行の中の文字は、その行で一番大きい文字のベースラインに揃う。文字揃えの行の幅は、行の最後のペンの位置 + Xのずれ
+// - 行の中で<pX>(Xの絶対指定)をした後の文字は、行の幅ではなく文字列全体の幅で揃う(左端からXの位置のまま、文字揃えでずらさない)
+// - <s大きさ>・<s+X>・<s*X>で大きさを変え、<s>で元に戻す。改行しても続く
 bool build_glyphs(EDIT_SECTION* edit, const TextSetting& t, std::vector<Glyph>& glyphs, std::wstring& error) {
 	IDWriteFont* font = edit->get_font(t.font.c_str());
 	ComPtr<IDWriteFontFace> face;
@@ -201,52 +228,117 @@ bool build_glyphs(EDIT_SECTION* edit, const TextSetting& t, std::vector<Glyph>& 
 	}
 	DWRITE_FONT_METRICS m;
 	face->GetMetrics(&m);
-	const double scale = t.size / m.designUnitsPerEm;
-	const double line_height = (m.ascent + m.descent + m.lineGap) * scale;
+	const double em = m.designUnitsPerEm;
+	const double ascent_ratio = m.ascent / em, line_ratio = (m.ascent + m.descent + m.lineGap) / em;
 
-	struct Line { std::vector<size_t> members; double width = 0; };
+	struct Line { std::vector<size_t> members; double width = 0, ascent = 0, height = 0; };
 	std::vector<Line> lines(1);
-	for (size_t i = 0; i < t.text.size(); i++) {
-		UINT32 code = t.text[i];
-		if (code == L'\n') { lines.emplace_back(); continue; }
-		if (IS_HIGH_SURROGATE(t.text[i]) && i + 1 < t.text.size() && IS_LOW_SURROGATE(t.text[i + 1])) {
-			code = 0x10000 + ((code - 0xD800) << 10) + (t.text[i + 1] - 0xDC00);
-			i++;
+	double size = t.size, pen = 0, offset_x = 0, offset_y = 0, top = 0;
+	bool after_glyph = false;	// 最後にペンを進めたのが文字か(字間は文字の後にだけ入る)
+	bool absolute_x = false;	// この行でXの絶対指定をしたか
+	std::vector<bool> unaligned;	// 文字ごとに、文字揃えでずらさないか
+	auto end_line = [&]() {
+		Line& line = lines.back();
+		line.width = pen - (after_glyph ? t.char_space : 0) + offset_x;
+		if (line.members.empty()) line.height = size * line_ratio;	// 文字の無い行は今の大きさの高さ
+	};
+	try {
+		for (size_t i = 0; i < t.text.size(); i++) {
+			UINT32 code = t.text[i];
+			if (code == L'<') {
+				const size_t close = t.text.find(L'>', i);
+				const std::wstring body = close == std::wstring::npos ? L"" : t.text.substr(i + 1, close - i - 1);
+				if (body.empty() || (body[0] != L'p' && body[0] != L's')) throw std::wstring(L"制御文字は<p>(座標)と<s>(サイズ)だけ対応しています。");
+				const std::vector<std::wstring> parts = split_control(body.substr(1));
+				if (body[0] == L'p') {
+					if (parts.size() > 3 || (parts.size() == 3 && !parts[2].empty())) throw std::wstring(L"<p>のZ座標には対応していません。");
+					double value;
+					bool relative;
+					if (parts.size() == 1 && parts[0].empty()) {
+						offset_x = offset_y = 0;
+					} else {
+						if (parse_control_number(parts[0], value, relative)) {
+							if (relative) offset_x += value;
+							else { pen = value; offset_x = 0; after_glyph = false; absolute_x = true; }
+						}
+						if (parts.size() > 1 && parse_control_number(parts[1], value, relative)) {
+							if (relative) offset_y += value;
+							else { top = value; offset_y = 0; }
+						}
+					}
+				} else {
+					if (parts.size() > 1) throw std::wstring(L"<s>はサイズの指定だけ対応しています(フォント・スタイル・縁取りは<s>では指定できません)。");
+					if (parts[0].empty()) {
+						size = t.size;
+					} else if (parts[0][0] == L'*') {
+						double value;
+						bool relative;
+						if (!parse_control_number(parts[0].substr(1), value, relative) || relative) throw std::wstring(L"制御文字「<" + body + L">」を読めません。");
+						size *= value;
+					} else {
+						double value;
+						bool relative;
+						parse_control_number(parts[0], value, relative);
+						size = relative ? size + value : value;
+					}
+					if (!(size > 0)) throw std::wstring(L"制御文字「<" + body + L">」の大きさが0以下です。");
+				}
+				i = close;
+				continue;
+			}
+			if (code == L'\n') {
+				end_line();
+				const Line& line = lines.back();
+				top += offset_y + line.height + t.line_space;
+				pen = offset_x = offset_y = 0;
+				after_glyph = false;
+				absolute_x = false;
+				lines.emplace_back();
+				continue;
+			}
+			if (IS_HIGH_SURROGATE(t.text[i]) && i + 1 < t.text.size() && IS_LOW_SURROGATE(t.text[i + 1])) {
+				code = 0x10000 + ((code - 0xD800) << 10) + (t.text[i + 1] - 0xDC00);
+				i++;
+			}
+			UINT16 index = 0;
+			if (FAILED(face->GetGlyphIndices(&code, 1, &index))) return false;
+			if (!index && code != L' ' && code != 0x3000) throw std::wstring(L"フォント「" + t.font + L"」に無い文字があります。");
+			Glyph g;
+			g.code = code;
+			g.size = size;
+			DWRITE_GLYPH_METRICS gm;
+			if (FAILED(face->GetDesignGlyphMetrics(&index, 1, &gm))) return false;
+			OutlineSink sink;
+			if (FAILED(face->GetGlyphRunOutline((float)size, &index, nullptr, nullptr, 1, FALSE, FALSE, &sink))) return false;
+			g.contours = std::move(sink.contours);
+			// 位置は後でベースライン・文字揃えの分を足す。行の途中の<pX,Y>はその後の文字だけを動かすので、上端は文字ごとに持つ
+			g.origin = { pen + offset_x, top + offset_y };
+			pen += gm.advanceWidth * size / em + t.char_space;
+			after_glyph = true;
+			Line& line = lines.back();
+			line.ascent = std::max(line.ascent, size * ascent_ratio);
+			line.height = std::max(line.height, size * line_ratio);
+			line.members.push_back(glyphs.size());
+			glyphs.push_back(std::move(g));
+			unaligned.push_back(absolute_x);
 		}
-		UINT16 index = 0;
-		if (FAILED(face->GetGlyphIndices(&code, 1, &index))) return false;
-		if (!index && code != L' ' && code != 0x3000) {
-			error = L"フォント「" + t.font + L"」に無い文字があります。";
-			return false;
-		}
-		Glyph g;
-		g.code = code;
-		DWRITE_GLYPH_METRICS gm;
-		if (FAILED(face->GetDesignGlyphMetrics(&index, 1, &gm))) return false;
-		OutlineSink sink;
-		if (FAILED(face->GetGlyphRunOutline((float)t.size, &index, nullptr, nullptr, 1, FALSE, FALSE, &sink))) return false;
-		g.contours = std::move(sink.contours);
-		g.origin.x = lines.back().width;
-		lines.back().width += gm.advanceWidth * scale + t.char_space;
-		lines.back().members.push_back(glyphs.size());
-		glyphs.push_back(std::move(g));
+	} catch (const std::wstring& message) {
+		error = message;
+		return false;
 	}
+	end_line();
 
 	double width = 0;
-	for (auto& l : lines) {
-		if (!l.members.empty()) l.width -= t.char_space;	// 字間は文字の間にだけ入る
-		width = std::max(width, l.width);
-	}
-	const double pitch = line_height + t.line_space;
+	for (auto& l : lines) width = std::max(width, l.width);
 	const bool center = t.align.find(L"中央") == 0;
 	const bool right = t.align.find(L"右") == 0;
-	for (size_t row = 0; row < lines.size(); row++) {
-		double shift = center ? (width - lines[row].width) / 2 : right ? width - lines[row].width : 0;
-		for (size_t index : lines[row].members) {
+	for (const Line& line : lines) {
+		const double shift = center ? (width - line.width) / 2 : right ? width - line.width : 0;
+		for (size_t index : line.members) {
 			Glyph& g = glyphs[index];
 			// 本体の文字の位置は1/8ピクセル単位(実機で測定)
-			g.origin.x = std::round((g.origin.x + shift) * 8) / 8;
-			g.origin.y = std::round((pitch * row + m.ascent * scale) * 8) / 8;
+			g.origin.x = std::round((g.origin.x + (unaligned[index] ? 0 : shift)) * 8) / 8;
+			g.origin.y = std::round((g.origin.y + line.ascent) * 8) / 8;
 		}
 	}
 	return true;
@@ -631,7 +723,8 @@ void write_points(EDIT_SECTION* edit, EFFECT_HANDLE path, const std::vector<doub
 // 同じフォント・サイズの前回の結果があれば、対応する文字の編集を構造ごと引き継ぐ。無ければinitial(あれば)を使う
 std::vector<double> write_shape(EDIT_SECTION* edit, EFFECT_HANDLE path, const std::vector<Glyph>& glyphs, const TextSetting& t,
 	LPCWSTR item_points, LPCWSTR item_handles, LPCWSTR item_meta, LPCWSTR item_base, LPCWSTR item_base_meta, bool keep_edits, UINT32 text_hash,
-	const std::vector<double>* initial, const std::vector<double>* initial_meta, std::vector<double>& result_meta) {
+	const std::vector<double>* initial, const std::vector<double>* initial_meta, const std::vector<double>& old_base_meta,
+	const std::vector<double>& old_base_fallback, std::vector<double>& result_meta) {
 	std::vector<double> pristine, meta(META_HEADER, 0.0);
 	for (auto& g : glyphs) {
 		meta.push_back(g.code);
@@ -674,6 +767,27 @@ std::vector<double> write_shape(EDIT_SECTION* edit, EFFECT_HANDLE path, const st
 		if (first * 2 == old_points.size()) {
 			kept = true;
 			matches = match_glyphs(old_glyphs, glyphs);
+			// <s>で大きさを変えた文字は引き継がない。大きさは保存していないので、前回の無編集の座標(元の座標)の文字の高さで比べる
+			// (old_base_meta は書き込む前に読んだ前回の元の輪郭情報。形状2の元の座標も、文字の構造はこれと同じ)
+			// 元の座標2を持たない(`0,0`。移動が無く元の座標と同じだった)時は、書き込む前に読んだ前回の元の座標で比べる
+			std::vector<double> old_base = parse_numbers(edit->get_effect_item_value(path, item_base));
+			if (old_base.size() <= 2) old_base = old_base_fallback;
+			auto glyph_height = [](const std::vector<double>& points, const std::vector<double>& glyph_meta, int g) {
+				size_t head, first_point, count;
+				if (!find_glyph(glyph_meta, g, head, first_point, count) || (first_point + count) * 2 > points.size()) return -1.0;
+				double y0 = 0, y1 = 0;
+				for (size_t k = 0; k < count; k++) {
+					const double y = points[(first_point + k) * 2 + 1];
+					if (!k || y < y0) y0 = y;
+					if (!k || y > y1) y1 = y;
+				}
+				return y1 - y0;
+			};
+			for (int j = 0; j < (int)glyphs.size(); j++) {
+				if (matches[j] < 0) continue;
+				const double before = glyph_height(old_base, old_base_meta, matches[j]), after = glyph_height(pristine, meta, j);
+				if (before < 0 || std::abs(before - after) > 0.5 + after * 0.01) matches[j] = -1;
+			}
 		}
 	}
 
@@ -792,7 +906,6 @@ void generate(EDIT_SECTION* edit, OBJECT_HANDLE object, LPCWSTR effect, bool kee
 	t.char_space = item_number(edit, text_effect, L"字間");
 	t.line_space = item_number(edit, text_effect, L"行間");
 
-	if (t.text.find(L'<') != std::wstring::npos) { show_message(L"制御文字を含むテキストには対応していません。"); return; }
 	if (item_string(edit, text_effect, L"文字装飾") != L"標準文字" || item_number(edit, text_effect, L"B") != 0 || item_number(edit, text_effect, L"I") != 0) {
 		show_message(L"文字装飾が「標準文字」で、太字・斜体でないテキストのみ対応しています。");
 		return;
@@ -841,7 +954,9 @@ void generate(EDIT_SECTION* edit, OBJECT_HANDLE object, LPCWSTR effect, bool kee
 	const UINT32 text_hash = text_setting_hash(edit, text_effect);
 
 	std::vector<double> meta1, meta2;
-	const std::vector<double> points1 = write_shape(edit, path, glyphs, t, ITEM_POINTS, ITEM_HANDLES, ITEM_META, ITEM_BASE, ITEM_BASE_META, keep_edits, text_hash, nullptr, nullptr, meta1);
+	const std::vector<double> old_base_meta = parse_numbers(edit->get_effect_item_value(path, ITEM_BASE_META));
+	const std::vector<double> old_base1 = parse_numbers(edit->get_effect_item_value(path, ITEM_BASE));
+	const std::vector<double> points1 = write_shape(edit, path, glyphs, t, ITEM_POINTS, ITEM_HANDLES, ITEM_META, ITEM_BASE, ITEM_BASE_META, keep_edits, text_hash, nullptr, nullptr, old_base_meta, old_base1, meta1);
 
 	// 形状2: サイズ・字間・行間に移動方法があれば終了値から作り、補間のトラックバーへ同じ移動方法を設定する
 	TextSetting t2 = t;
@@ -867,7 +982,16 @@ void generate(EDIT_SECTION* edit, OBJECT_HANDLE object, LPCWSTR effect, bool kee
 		return;
 	}
 	write_shape(edit, path, glyphs2, t2, ITEM_POINTS2, ITEM_HANDLES2, ITEM_META2, ITEM_BASE2, nullptr, keep_edits, text_hash,
-		motion.empty() ? &points1 : nullptr, motion.empty() ? &meta1 : nullptr, meta2);
+		motion.empty() ? &points1 : nullptr, motion.empty() ? &meta1 : nullptr, old_base_meta, old_base1, meta2);
+	// 元の座標2が元の座標と同じ時(移動が無い時)は持たない(`0,0`にする)。設定値は描画のたびに読まれ、長文では数msかかるため。
+	// スクリプトは元の座標2の数が元の座標と違う時は補間せずに元の座標を使うので、同じ値を持つ時と描画は変わらない
+	{
+		LPCSTR value = edit->get_effect_item_value(path, ITEM_BASE);
+		const std::string base1 = value ? value : "";
+		value = edit->get_effect_item_value(path, ITEM_BASE2);
+		const std::string base2 = value ? value : "";
+		if (!base1.empty() && base1 == base2) edit->set_effect_item_value(path, ITEM_BASE2, "0,0");
+	}
 	if (!motion.empty()) {
 		edit->set_effect_item_value(path, ITEM_MORPH_T, ("0.00,100.00" + motion).c_str());
 		edit->set_effect_item_value(path, ITEM_MORPH, "1");
@@ -4270,7 +4394,7 @@ FILTER_PLUGIN_TABLE g_filter_table = {
 	FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_FILTER,
 	PLUGIN_NAME,
 	L"teruyoshi",
-	L"テキストの輪郭をアンカーで編集できるパスに変換する v1.1.2 By teruyoshi",
+	L"テキストの輪郭をアンカーで編集できるパスに変換する v1.3 By teruyoshi",
 	g_items,
 	proc_video,
 	nullptr, nullptr, nullptr,
@@ -4907,6 +5031,9 @@ struct PenMap {
 	struct Layer { float time, cover; };
 	std::vector<int> layer_index;	// 画素ごとのlayersの番号(無ければ-1)
 	std::vector<std::vector<Layer>> layers;
+	std::vector<int> owner;			// 画素ごとの、時刻を決めた字の番号(無ければ-1)。補間の途中で字ごとに伸縮して写す時に使う
+	struct Box { double x0, y0, x1, y1; bool any; };
+	std::vector<Box> boxes;			// 字ごとの輪郭の範囲
 };
 
 double polyline_length(const std::vector<Vec>& line) {
@@ -5467,293 +5594,471 @@ std::vector<Proposal> propose_splits(const EdGlyph& glyph, const std::vector<std
 	return result;
 }
 
-// customは編集された筆順、referenceはその筆順を編集した形状(形状1)の輪郭
-std::shared_ptr<PenMap> build_pen_map(const std::vector<double>& points, const std::vector<double>& meta, UINT32 key,
-	const std::vector<GlyphStrokes>& custom, const std::vector<double>& reference) {
-	auto map = std::make_shared<PenMap>();
-	map->key = key;
-	const EdModel model = load_model(points, meta, 0);
-	const EdModel reference_model = reference.empty() ? EdModel() : load_model(reference, meta, 0);
-	bool any = false;
-	double x0 = 0, x1 = 0, y0 = 0, y1 = 0;
-	struct GlyphBox { double x0, y0, x1, y1; bool any; };
-	std::vector<GlyphBox> boxes(model.size(), GlyphBox{ 0, 0, 0, 0, false });
-	for (size_t g = 0; g < model.size(); g++) {
-		for (const EdContour& c : model[g].contours) {
-			for (const Vec& v : flatten_contour(c, 0)) {
-				GlyphBox& box = boxes[g];
-				if (!box.any) box = { v.x, v.y, v.x, v.y, true };
-				box.x0 = std::min(box.x0, v.x); box.x1 = std::max(box.x1, v.x);
-				box.y0 = std::min(box.y0, v.y); box.y1 = std::max(box.y1, v.y);
-				if (!any) { x0 = x1 = v.x; y0 = y1 = v.y; any = true; }
-				x0 = std::min(x0, v.x); x1 = std::max(x1, v.x);
-				y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
+// 1文字の書き進みの表。表は文字ごとに作って覚え、全体の表はそれを並べて作る(編集した文字だけ作り直す)。
+// 時刻は全体の長さで割るまで決まらないので、画素ごとに「どの画のどこで書かれるか」を、全体の表を作る時と同じ順で持つ
+struct GlyphPen {
+	PenMap::Box box;
+	int x0 = 0, y0 = 0, w = 0, h = 0;	// この字の表の範囲(輪郭の座標)
+	double length = 0;					// この字の画の長さの合計(筆順データに無い字は字の大きさ)
+	std::vector<double> lengths;		// 画ごとの長さ
+	struct Write {
+		int pixel;		// この字の表の中の位置
+		int stroke;		// 画の番号。-1なら字の最後(画の無いアイランド・筆順データに無い字)
+		double along;	// 画の始点からの長さ
+		float cover;	// 複数のアイランドが覆う画素の、このアイランドの覆う割合(layerの時だけ)
+		bool layer;
+	};
+	std::vector<Write> writes;
+};
+
+PenMap::Box glyph_box(const EdGlyph& glyph) {
+	PenMap::Box box{ 0, 0, 0, 0, false };
+	for (const EdContour& c : glyph.contours) {
+		for (const Vec& v : flatten_contour(c, 0)) {
+			if (!box.any) box = { v.x, v.y, v.x, v.y, true };
+			box.x0 = std::min(box.x0, v.x); box.x1 = std::max(box.x1, v.x);
+			box.y0 = std::min(box.y0, v.y); box.y1 = std::max(box.y1, v.y);
+		}
+	}
+	return box;
+}
+
+// referenceは、筆順を編集した形状(形状1)のこの字(無ければnullptr)
+std::shared_ptr<GlyphPen> build_glyph_pen(const EdGlyph& glyph, const EdGlyph* reference, const GlyphStrokes* custom) {
+	auto pen = std::make_shared<GlyphPen>();
+	const PenMap::Box& box = pen->box = glyph_box(glyph);
+	if (!box.any) return pen;
+	pen->x0 = (int)std::floor(box.x0) - 3;
+	pen->y0 = (int)std::floor(box.y0) - 3;
+	pen->w = (int)std::ceil(box.x1) + 3 - pen->x0;
+	pen->h = (int)std::ceil(box.y1) + 3 - pen->y0;
+	const int map_w = pen->w, map_h = pen->h;
+
+	// 中心線を、字の範囲に合わせて置く
+	std::vector<std::vector<Vec>> layout_strokes;
+	std::vector<std::vector<double>> halves;	// 画の点ごとの、線の太さの半分
+	std::vector<PIXEL_RGBA> cover((size_t)map_w * map_h);
+	{
+		Rasterizer raster(map_w, map_h);
+		const auto screen = [&](Vec v) { return Vec{ v.x - pen->x0, v.y - pen->y0 }; };
+		for (const EdContour& c : glyph.contours) {
+			const std::vector<Vec> line = flatten_contour(c, 0);
+			for (size_t i = 0; i < line.size(); i++) raster.line(screen(line[i]), screen(line[(i + 1) % line.size()]));
+		}
+		raster.write(cover.data(), 0, 0, 0);
+	}
+	double area = 0;
+	for (const PIXEL_RGBA& p : cover) area += p.a / 255.0;
+	const bool edited = custom && custom->custom;
+	std::vector<std::vector<Vec>> strokes = edited ? custom->lines : find_strokes((UINT32)glyph.head[0]);
+	if (!strokes.empty()) {
+		// 編集された筆順は形状1の座標なので、形状の間を描く時は字の範囲に合わせて伸縮させる
+		double ref_x0 = box.x0, ref_y0 = box.y0, ref_x1 = box.x1, ref_y1 = box.y1;
+		if (edited && reference) {
+			bool found = false;
+			for (const EdContour& c : reference->contours) {
+				for (const Vec& v : flatten_contour(c, 0)) {
+					if (!found) { ref_x0 = ref_x1 = v.x; ref_y0 = ref_y1 = v.y; found = true; }
+					ref_x0 = std::min(ref_x0, v.x); ref_x1 = std::max(ref_x1, v.x);
+					ref_y0 = std::min(ref_y0, v.y); ref_y1 = std::max(ref_y1, v.y);
+				}
+			}
+		}
+		const double ratio_x = ref_x1 - ref_x0 > 0 ? (box.x1 - box.x0) / (ref_x1 - ref_x0) : 1;
+		const double ratio_y = ref_y1 - ref_y0 > 0 ? (box.y1 - box.y0) / (ref_y1 - ref_y0) : 1;
+		double cx0 = 1e30, cx1 = -1e30, cy0 = 1e30, cy1 = -1e30, unit = 0;
+		for (const auto& line : strokes) {
+			unit += polyline_length(line);
+			for (const Vec& v : line) {
+				cx0 = std::min(cx0, v.x); cx1 = std::max(cx1, v.x);
+				cy0 = std::min(cy0, v.y); cy1 = std::max(cy1, v.y);
+			}
+		}
+		const double ink_w = box.x1 - box.x0, ink_h = box.y1 - box.y0;
+		// 線の太さ = 面積 / 長さ。中心線の範囲は字の範囲より太さの半分だけ内側にある
+		const double rough = std::max(ink_w, ink_h) / std::max({ cx1 - cx0, cy1 - cy0, 1.0 });
+		const double thick = area / std::max(unit * rough, 1.0);
+		const double sx = cx1 - cx0 > 1 ? std::max(ink_w - thick, 1.0) / (cx1 - cx0) : rough;
+		const double sy = cy1 - cy0 > 1 ? std::max(ink_h - thick, 1.0) / (cy1 - cy0) : rough;
+		const double center_x = (box.x0 + box.x1) / 2, center_y = (box.y0 + box.y1) / 2;
+		const std::vector<float> field = ink_distance(cover, map_w, map_h);
+		for (auto& line : strokes) {
+			for (Vec& v : line) {
+				if (edited) v = { box.x0 + (v.x - ref_x0) * ratio_x - pen->x0, box.y0 + (v.y - ref_y0) * ratio_y - pen->y0 };
+				else v = { center_x + (v.x - (cx0 + cx1) / 2) * sx - pen->x0, center_y + (v.y - (cy0 + cy1) / 2) * sy - pen->y0 };
+			}
+			line = resample_line(line, 2);
+			// 編集された線は、利用者が決めた位置のまま使う
+			if (!edited) snap_line(line, field, map_w, map_h, std::max(thick, 3.0));
+			// 中央の点の外までの距離が太さの半分になる。交差した所は距離が大きく出るので、線に沿った近傍の中央値を使う
+			const int count = (int)line.size();
+			const int window = std::max(3, (int)std::ceil(thick));	// 点は2ピクセル間隔なので、前後に太さの2倍の範囲を見る
+			std::vector<double> half(count);
+			for (int i = 0; i < count; i++) {
+				std::vector<double> near_values;
+				for (int k = std::max(i - window, 0); k <= std::min(i + window, count - 1); k++) {
+					const int x = (int)line[k].x, y = (int)line[k].y;
+					near_values.push_back(x >= 0 && x < map_w && y >= 0 && y < map_h ? field[(size_t)y * map_w + x] : 0.0);
+				}
+				std::nth_element(near_values.begin(), near_values.begin() + near_values.size() / 2, near_values.end());
+				half[i] = std::max(1.5, near_values[near_values.size() / 2]);
+			}
+			halves.push_back(std::move(half));
+			const double length = polyline_length(line);
+			pen->lengths.push_back(length);
+			pen->length += length;
+		}
+		layout_strokes = std::move(strokes);
+	} else {
+		// 筆順データに無い文字は、順番が来た時にまとめて現れる
+		pen->length = std::max(box.x1 - box.x0, box.y1 - box.y0);
+	}
+
+	const int stroke_num = (int)layout_strokes.size();
+	// アイランドと画の対応: 画は、その線の点を最も多く含むアイランドのものにする。画が無いアイランドは最も近い画のものにする
+	const std::vector<int> contour_island = contour_islands(glyph, 0);
+	const int island_num = contour_island.empty() ? 0 : *std::max_element(contour_island.begin(), contour_island.end()) + 1;
+	std::vector<std::vector<PIXEL_RGBA>> island_covers(island_num);
+	for (int i = 0; i < island_num; i++) {
+		island_covers[i].resize((size_t)map_w * map_h);
+		Rasterizer raster(map_w, map_h);
+		for (size_t c = 0; c < glyph.contours.size(); c++) {
+			if (contour_island[c] != i) continue;
+			const std::vector<Vec> line = flatten_contour(glyph.contours[c], 0);
+			for (size_t k = 0; k < line.size(); k++) {
+				const Vec a = line[k], b = line[(k + 1) % line.size()];
+				raster.line({ a.x - pen->x0, a.y - pen->y0 }, { b.x - pen->x0, b.y - pen->y0 });
+			}
+		}
+		raster.write(island_covers[i].data(), 0, 0, 0);
+	}
+	std::vector<std::vector<int>> island_strokes(std::max(island_num, 1));
+	for (int s = 0; s < stroke_num; s++) {
+		int best_island = 0;
+		size_t best_count = 0;
+		for (int i = 0; i < island_num; i++) {
+			size_t count = 0;
+			for (const Vec& v : layout_strokes[s]) {
+				const int x = (int)v.x, y = (int)v.y;
+				if (x >= 0 && x < map_w && y >= 0 && y < map_h && island_covers[i][(size_t)y * map_w + x].a >= 128) count++;
+			}
+			if (count > best_count) { best_count = count; best_island = i; }
+		}
+		island_strokes[best_island].push_back(s);
+	}
+	for (int i = 0; i < island_num && stroke_num; i++) {
+		if (!island_strokes[i].empty()) continue;
+		double best = 1e30;
+		int nearest = 0;
+		// 1つおきの画素で調べる(v1.1.2までは全体の表の左上から数えていた。今は字の表の左上から数えるので、偶奇が違う字では選ぶ画が変わることがある)
+		for (int y = 0; y < map_h; y += 2) {
+			for (int x = 0; x < map_w; x += 2) {
+				if (!island_covers[i][(size_t)y * map_w + x].a) continue;
+				for (int s = 0; s < stroke_num; s++) {
+					double d, along;
+					size_t index;
+					nearest_on_line(layout_strokes[s], { x + 0.5, y + 0.5 }, d, along, index);
+					if (d < best) { best = d; nearest = s; }
+				}
+			}
+		}
+		island_strokes[i].push_back(nearest);
+	}
+	std::vector<double> stroke_start(stroke_num);	// この字の先頭からの画の始まり
+	for (int s = 0; s < stroke_num; s++) stroke_start[s] = s ? stroke_start[s - 1] + pen->lengths[s - 1] : 0;
+	// 1つのアイランドに複数の画がある時だけ、画ごとの領域を求める(まだ分割していない所)
+	std::vector<bool> needs_region(stroke_num, false);
+	for (const auto& list : island_strokes) if (list.size() > 1) for (int s : list) needs_region[s] = true;
+	// 画ごとの領域: 線の太さの中に入る画素のうち、つながった最大の塊だけにする
+	// (中心線がフォントの線とずれて別の線を通っても、離れた場所の線がその画として先に現れない)
+	std::vector<std::vector<char>> regions(stroke_num);
+	for (int s = 0; s < stroke_num; s++) {
+		if (!needs_region[s]) continue;
+		std::vector<char>& region = regions[s];
+		region.assign((size_t)map_w * map_h, 0);
+		for (int y = 0; y < map_h; y++) {
+			for (int x = 0; x < map_w; x++) {
+				if (!cover[(size_t)y * map_w + x].a) continue;
+				double d, along;
+				size_t index;
+				nearest_on_line(layout_strokes[s], { x + 0.5, y + 0.5 }, d, along, index);
+				if (d <= halves[s][index] + 0.25) region[(size_t)y * map_w + x] = 1;
+			}
+		}
+		size_t best_size = 0;
+		char best_label = 0, label = 1;
+		std::vector<size_t> stack;
+		for (size_t start = 0; start < region.size(); start++) {
+			if (region[start] != 1) continue;
+			if (label == 127) break;
+			label++;
+			size_t size = 0;
+			region[start] = label;
+			stack.push_back(start);
+			while (!stack.empty()) {
+				const size_t at = stack.back();
+				stack.pop_back();
+				size++;
+				const int px = (int)(at % map_w);
+				auto visit = [&](size_t n) { if (region[n] == 1) { region[n] = label; stack.push_back(n); } };
+				if (px > 0) visit(at - 1);
+				if (px + 1 < map_w) visit(at + 1);
+				if (at >= (size_t)map_w) visit(at - map_w);
+				if (at + map_w < region.size()) visit(at + map_w);
+			}
+			if (size > best_size) { best_size = size; best_label = label; }
+		}
+		for (char& value : region) value = value == best_label && best_label ? 1 : 0;
+	}
+	// 画素の時刻は、属するアイランドの画だけで決める(他の画へはみ出さない)。複数のアイランドに属する所は最も早いものになる。
+	// 同じアイランドに複数の画がある時は、領域に入る画のうち最も早く通るものの時刻にする。
+	// どの領域にも入らなければ、太さに対して最も近い画にする(細い線のすぐ外にある太い線の端を、細い線のものにしない)
+	std::vector<unsigned char> island_count;
+	if (island_num >= 2) {
+		island_count.assign((size_t)map_w * map_h, 0);
+		for (const auto& c : island_covers) {
+			for (size_t i = 0; i < c.size(); i++) if (c[i].a) island_count[i]++;
+		}
+	}
+	for (int island = 0; island < std::max(island_num, 1); island++) {
+		const std::vector<int>& list = island_strokes[island];
+		for (int y = 0; y < map_h; y++) {
+			for (int x = 0; x < map_w; x++) {
+				const size_t at_pixel = (size_t)y * map_w + x;
+				if (island_num ? !island_covers[island][at_pixel].a : !cover[at_pixel].a) continue;
+				GlyphPen::Write write{ (int)at_pixel, -1, 0, 0, false };
+				if (!list.empty()) {
+					const Vec v{ x + 0.5, y + 0.5 };
+					double best = 1e30, early = 1e30;
+					int nearest_stroke = 0, early_stroke = -1;
+					double nearest_along = 0, early_along = 0;
+					for (int s : list) {
+						double d, along;
+						size_t index;
+						nearest_on_line(layout_strokes[s], v, d, along, index);
+						const double half = halves[s][index];
+						const double at = stroke_start[s] + along;
+						if (d / half < best) { best = d / half; nearest_stroke = s; nearest_along = along; }
+						if (list.size() > 1 && regions[s][at_pixel] && at < early) { early = at; early_stroke = s; early_along = along; }
+					}
+					write.stroke = early_stroke >= 0 ? early_stroke : nearest_stroke;
+					write.along = early_stroke >= 0 ? early_along : nearest_along;
+				}
+				if (!island_count.empty() && island_count[at_pixel] >= 2) {
+					write.layer = true;
+					write.cover = island_covers[island][at_pixel].a / 255.0f;
+				}
+				pen->writes.push_back(write);
 			}
 		}
 	}
+	return pen;
+}
+
+// 本体の画像の縁は自前の塗りより少し広いことがあるので、隣の時刻で埋める
+void fill_pen_edges(PenMap& map) {
+	for (int pass = 0; pass < 2; pass++) {
+		const std::vector<float> copy = map.time;
+		for (int y = 1; y + 1 < map.h; y++) {
+			for (int x = 1; x + 1 < map.w; x++) {
+				const size_t at = (size_t)y * map.w + x;
+				if (copy[at] >= 0) continue;
+				float best = -1;
+				size_t from = at;
+				for (const size_t n : { at - 1, at + 1, at - map.w, at + map.w }) {
+					if (copy[n] >= 0 && (best < 0 || copy[n] < best)) { best = copy[n]; from = n; }
+				}
+				map.time[at] = best;
+				if (best >= 0) map.owner[at] = map.owner[from];
+			}
+		}
+	}
+}
+
+// 文字ごとの表を並べて全体の表にする
+std::shared_ptr<PenMap> compose_pen_map(const std::vector<std::shared_ptr<const GlyphPen>>& glyphs, UINT32 key) {
+	auto map = std::make_shared<PenMap>();
+	map->key = key;
+	bool any = false;
+	int x1 = 0, y1 = 0;
+	for (const auto& pen : glyphs) {
+		map->boxes.push_back(pen->box);
+		if (!pen->box.any) continue;
+		if (!any) { map->x0 = pen->x0; map->y0 = pen->y0; x1 = pen->x0 + pen->w; y1 = pen->y0 + pen->h; any = true; }
+		map->x0 = std::min(map->x0, pen->x0); map->y0 = std::min(map->y0, pen->y0);
+		x1 = std::max(x1, pen->x0 + pen->w); y1 = std::max(y1, pen->y0 + pen->h);
+	}
 	if (!any) return map;
+	map->w = x1 - map->x0;
+	map->h = y1 - map->y0;
+	map->time.assign((size_t)map->w * map->h, -1.0f);
+	map->layer_index.assign((size_t)map->w * map->h, -1);
+	map->owner.assign((size_t)map->w * map->h, -1);
+	std::vector<double> starts(glyphs.size(), 0);
+	double total = 0;
+	for (size_t g = 0; g < glyphs.size(); g++) {
+		if (!glyphs[g]->box.any) continue;
+		starts[g] = total;
+		total += glyphs[g]->length;
+	}
+	map->total = std::max(total, 1.0);
+	for (size_t g = 0; g < glyphs.size(); g++) {
+		const GlyphPen& pen = *glyphs[g];
+		if (!pen.box.any) continue;
+		std::vector<double> stroke_start(pen.lengths.size());
+		for (size_t s = 0; s < pen.lengths.size(); s++) stroke_start[s] = s ? stroke_start[s - 1] + pen.lengths[s - 1] : starts[g];
+		const int dx = pen.x0 - map->x0, dy = pen.y0 - map->y0;
+		for (const GlyphPen::Write& write : pen.writes) {
+			const double value = write.stroke < 0 ? starts[g] + pen.length : stroke_start[write.stroke] + write.along;
+			const float normalized = (float)(value / map->total);
+			const size_t at = (size_t)(write.pixel / pen.w + dy) * map->w + (write.pixel % pen.w + dx);
+			float& time = map->time[at];
+			if (time < 0 || normalized < time) { time = normalized; map->owner[at] = (int)g; }
+			if (write.layer) {
+				int& layer = map->layer_index[at];
+				if (layer < 0) {
+					layer = (int)map->layers.size();
+					map->layers.emplace_back();
+				}
+				map->layers[layer].push_back({ normalized, write.cover });
+			}
+		}
+	}
+	fill_pen_edges(*map);
+	return map;
+}
+
+// customは編集された筆順、referenceはその筆順を編集した形状(形状1)の輪郭。覚えずに作る(高度な編集の確認で使う)
+std::shared_ptr<PenMap> build_pen_map(const std::vector<double>& points, const std::vector<double>& meta, UINT32 key,
+	const std::vector<GlyphStrokes>& custom, const std::vector<double>& reference) {
+	const EdModel model = load_model(points, meta, 0);
+	const EdModel reference_model = reference.empty() ? EdModel() : load_model(reference, meta, 0);
+	std::vector<std::shared_ptr<const GlyphPen>> glyphs;
+	for (size_t g = 0; g < model.size(); g++) {
+		glyphs.push_back(build_glyph_pen(model[g], g < reference_model.size() ? &reference_model[g] : nullptr, g < custom.size() ? &custom[g] : nullptr));
+	}
+	return compose_pen_map(glyphs, key);
+}
+
+// 1文字の表の鍵: その字の輪郭と、編集された筆順(あれば、伸縮の基準にする形状1の字も)
+UINT64 glyph_pen_key(const EdGlyph& glyph, const EdGlyph* reference, const GlyphStrokes* custom) {
+	auto mix_glyph = [](UINT64 hash, const EdGlyph& g) {
+		hash = hash_mix(hash, g.head);
+		for (const EdContour& c : g.contours) {
+			const UINT64 count = c.nodes.size();
+			hash = hash_mix(hash, &count, sizeof(count));
+			for (const EdNode& n : c.nodes) {
+				const double values[] = { n.p[0].x, n.p[0].y, n.next.curve ? 1.0 : 0.0, n.next.c1[0].x, n.next.c1[0].y, n.next.c2[0].x, n.next.c2[0].y };
+				hash = hash_mix(hash, values, sizeof(values));
+			}
+		}
+		return hash;
+	};
+	UINT64 hash = mix_glyph(5, glyph);
+	if (custom && custom->custom) {
+		for (const auto& line : custom->lines) {
+			const UINT64 count = line.size();
+			hash = hash_mix(hash, &count, sizeof(count));
+			if (!line.empty()) hash = hash_mix(hash, line.data(), line.size() * sizeof(Vec));
+		}
+		hash = reference ? mix_glyph(hash ^ 7, *reference) : hash_mix(hash, "none", 4);
+	}
+	return hash;
+}
+
+// エフェクトのIDごとの、作った表。全体の表は最近使った数個(補間の両端と今の形)、文字の表はそれらが使うものだけ覚える
+struct PenSlot {
+	std::mutex mutex;
+	struct Entry {
+		UINT64 key = 0;
+		std::shared_ptr<PenMap> map;
+		std::vector<UINT64> glyph_keys;
+	};
+	std::vector<Entry> maps;	// 最近使った順
+	std::map<UINT64, std::shared_ptr<const GlyphPen>> glyphs;
+	UINT64 warped_key = 0;		// 補間の途中の表(個別オブジェクトの部品ごとに呼ばれるので、同じ形なら使い回す)
+	std::shared_ptr<PenMap> warped;
+};
+const size_t PEN_SLOT_MAPS = 3;
+
+std::shared_ptr<PenMap> cached_pen_map(PenSlot& slot, const EdModel& model, const EdModel& reference_model, const std::vector<GlyphStrokes>& custom) {
+	std::vector<UINT64> keys;
+	UINT64 key = 11;
+	for (size_t g = 0; g < model.size(); g++) {
+		keys.push_back(glyph_pen_key(model[g], g < reference_model.size() ? &reference_model[g] : nullptr, g < custom.size() ? &custom[g] : nullptr));
+		key = hash_mix(key, &keys.back(), sizeof(UINT64));
+	}
+	for (size_t i = 0; i < slot.maps.size(); i++) {
+		if (slot.maps[i].key != key) continue;
+		std::rotate(slot.maps.begin(), slot.maps.begin() + i, slot.maps.begin() + i + 1);
+		return slot.maps.front().map;
+	}
+	std::vector<std::shared_ptr<const GlyphPen>> glyphs;
+	for (size_t g = 0; g < model.size(); g++) {
+		auto& cached = slot.glyphs[keys[g]];
+		if (!cached) cached = build_glyph_pen(model[g], g < reference_model.size() ? &reference_model[g] : nullptr, g < custom.size() ? &custom[g] : nullptr);
+		glyphs.push_back(cached);
+	}
+	PenSlot::Entry entry{ key, compose_pen_map(glyphs, (UINT32)key), keys };
+	slot.maps.insert(slot.maps.begin(), std::move(entry));
+	if (slot.maps.size() > PEN_SLOT_MAPS) slot.maps.resize(PEN_SLOT_MAPS);
+	// 覚えている全体の表が使わない文字の表は捨てる
+	std::map<UINT64, std::shared_ptr<const GlyphPen>> used;
+	for (const auto& e : slot.maps) for (UINT64 k : e.glyph_keys) { auto it = slot.glyphs.find(k); if (it != slot.glyphs.end()) used.insert(*it); }
+	slot.glyphs = std::move(used);
+	return slot.maps.front().map;
+}
+
+// 補間の途中: 端の形の表を、文字ごとの範囲の比で今の形へ伸縮して写す(画素ごとに作り直すと、毎フレーム字の数に比例して重い)
+std::shared_ptr<PenMap> warp_pen_map(const PenMap& source, const EdModel& model) {
+	auto map = std::make_shared<PenMap>();
+	map->key = source.key;
+	map->total = source.total;
+	map->layers = source.layers;
+	bool any = false;
+	double x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+	for (const EdGlyph& glyph : model) {
+		const PenMap::Box box = glyph_box(glyph);
+		map->boxes.push_back(box);
+		if (!box.any) continue;
+		if (!any) { x0 = box.x0; x1 = box.x1; y0 = box.y0; y1 = box.y1; any = true; }
+		x0 = std::min(x0, box.x0); x1 = std::max(x1, box.x1);
+		y0 = std::min(y0, box.y0); y1 = std::max(y1, box.y1);
+	}
+	if (!any || source.time.empty()) return map;
 	map->x0 = (int)std::floor(x0) - 3;
 	map->y0 = (int)std::floor(y0) - 3;
 	map->w = (int)std::ceil(x1) + 3 - map->x0;
 	map->h = (int)std::ceil(y1) + 3 - map->y0;
 	map->time.assign((size_t)map->w * map->h, -1.0f);
 	map->layer_index.assign((size_t)map->w * map->h, -1);
-
-	// 文字ごとの中心線を、字の範囲に合わせて置く
-	struct Layout {
-		std::vector<std::vector<Vec>> strokes;
-		std::vector<double> lengths;
-		std::vector<std::vector<double>> halves;	// 画の点ごとの、線の太さの半分
-		std::vector<PIXEL_RGBA> cover;
-		double start = 0, length = 0;
-	};
-	std::vector<Layout> layouts(model.size());
-	double total = 0;
-	for (size_t g = 0; g < model.size(); g++) {
-		Layout& layout = layouts[g];
-		const GlyphBox& box = boxes[g];
-		if (!box.any) continue;
-		layout.cover.resize((size_t)map->w * map->h);
-		std::vector<PIXEL_RGBA>& cover = layout.cover;
-		Rasterizer raster(map->w, map->h);
-		const auto screen = [&](Vec v) { return Vec{ v.x - map->x0, v.y - map->y0 }; };
-		double area = 0;
-		for (const EdContour& c : model[g].contours) {
-			const std::vector<Vec> line = flatten_contour(c, 0);
-			for (size_t i = 0; i < line.size(); i++) raster.line(screen(line[i]), screen(line[(i + 1) % line.size()]));
-		}
-		raster.write(cover.data(), 0, 0, 0);
-		for (const PIXEL_RGBA& p : cover) area += p.a / 255.0;
-		const bool edited = g < custom.size() && custom[g].custom;
-		std::vector<std::vector<Vec>> strokes = edited ? custom[g].lines : find_strokes((UINT32)model[g].head[0]);
-		if (!strokes.empty()) {
-			// 編集された筆順は形状1の座標なので、形状の間を描く時は字の範囲に合わせて伸縮させる
-			double ref_x0 = box.x0, ref_y0 = box.y0, ref_x1 = box.x1, ref_y1 = box.y1;
-			if (edited && g < reference_model.size()) {
-				bool found = false;
-				for (const EdContour& c : reference_model[g].contours) {
-					for (const Vec& v : flatten_contour(c, 0)) {
-						if (!found) { ref_x0 = ref_x1 = v.x; ref_y0 = ref_y1 = v.y; found = true; }
-						ref_x0 = std::min(ref_x0, v.x); ref_x1 = std::max(ref_x1, v.x);
-						ref_y0 = std::min(ref_y0, v.y); ref_y1 = std::max(ref_y1, v.y);
-					}
-				}
-			}
-			const double ratio_x = ref_x1 - ref_x0 > 0 ? (box.x1 - box.x0) / (ref_x1 - ref_x0) : 1;
-			const double ratio_y = ref_y1 - ref_y0 > 0 ? (box.y1 - box.y0) / (ref_y1 - ref_y0) : 1;
-			double cx0 = 1e30, cx1 = -1e30, cy0 = 1e30, cy1 = -1e30, unit = 0;
-			for (const auto& line : strokes) {
-				unit += polyline_length(line);
-				for (const Vec& v : line) {
-					cx0 = std::min(cx0, v.x); cx1 = std::max(cx1, v.x);
-					cy0 = std::min(cy0, v.y); cy1 = std::max(cy1, v.y);
-				}
-			}
-			const double ink_w = box.x1 - box.x0, ink_h = box.y1 - box.y0;
-			// 線の太さ = 面積 / 長さ。中心線の範囲は字の範囲より太さの半分だけ内側にある
-			const double rough = std::max(ink_w, ink_h) / std::max({ cx1 - cx0, cy1 - cy0, 1.0 });
-			const double thick = area / std::max(unit * rough, 1.0);
-			const double sx = cx1 - cx0 > 1 ? std::max(ink_w - thick, 1.0) / (cx1 - cx0) : rough;
-			const double sy = cy1 - cy0 > 1 ? std::max(ink_h - thick, 1.0) / (cy1 - cy0) : rough;
-			const double center_x = (box.x0 + box.x1) / 2, center_y = (box.y0 + box.y1) / 2;
-			const std::vector<float> field = ink_distance(cover, map->w, map->h);
-			for (auto& line : strokes) {
-				for (Vec& v : line) {
-					if (edited) v = { box.x0 + (v.x - ref_x0) * ratio_x - map->x0, box.y0 + (v.y - ref_y0) * ratio_y - map->y0 };
-					else v = { center_x + (v.x - (cx0 + cx1) / 2) * sx - map->x0, center_y + (v.y - (cy0 + cy1) / 2) * sy - map->y0 };
-				}
-				line = resample_line(line, 2);
-				// 編集された線は、利用者が決めた位置のまま使う
-				if (!edited) snap_line(line, field, map->w, map->h, std::max(thick, 3.0));
-				// 中央の点の外までの距離が太さの半分になる。交差した所は距離が大きく出るので、線に沿った近傍の中央値を使う
-				const int count = (int)line.size();
-				const int window = std::max(3, (int)std::ceil(thick));	// 点は2ピクセル間隔なので、前後に太さの2倍の範囲を見る
-				std::vector<double> half(count);
-				for (int i = 0; i < count; i++) {
-					std::vector<double> near_values;
-					for (int k = std::max(i - window, 0); k <= std::min(i + window, count - 1); k++) {
-						const int x = (int)line[k].x, y = (int)line[k].y;
-						near_values.push_back(x >= 0 && x < map->w && y >= 0 && y < map->h ? field[(size_t)y * map->w + x] : 0.0);
-					}
-					std::nth_element(near_values.begin(), near_values.begin() + near_values.size() / 2, near_values.end());
-					half[i] = std::max(1.5, near_values[near_values.size() / 2]);
-				}
-				layout.halves.push_back(std::move(half));
-				const double length = polyline_length(line);
-				layout.lengths.push_back(length);
-				layout.length += length;
-			}
-			layout.strokes = std::move(strokes);
-		} else {
-			// 筆順データに無い文字は、順番が来た時にまとめて現れる
-			layout.length = std::max(box.x1 - box.x0, box.y1 - box.y0);
-		}
-		layout.start = total;
-		total += layout.length;
-	}
-	map->total = std::max(total, 1.0);
-
-	for (size_t g = 0; g < model.size(); g++) {
-		const Layout& layout = layouts[g];
-		if (layout.cover.empty()) continue;
-		const int stroke_num = (int)layout.strokes.size();
-		// アイランドと画の対応: 画は、その線の点を最も多く含むアイランドのものにする。画が無いアイランドは最も近い画のものにする
-		const std::vector<int> contour_island = contour_islands(model[g], 0);
-		const int island_num = contour_island.empty() ? 0 : *std::max_element(contour_island.begin(), contour_island.end()) + 1;
-		std::vector<std::vector<PIXEL_RGBA>> island_covers(island_num);
-		for (int i = 0; i < island_num; i++) {
-			island_covers[i].resize((size_t)map->w * map->h);
-			Rasterizer raster(map->w, map->h);
-			for (size_t c = 0; c < model[g].contours.size(); c++) {
-				if (contour_island[c] != i) continue;
-				const std::vector<Vec> line = flatten_contour(model[g].contours[c], 0);
-				for (size_t k = 0; k < line.size(); k++) {
-					const Vec a = line[k], b = line[(k + 1) % line.size()];
-					raster.line({ a.x - map->x0, a.y - map->y0 }, { b.x - map->x0, b.y - map->y0 });
-				}
-			}
-			raster.write(island_covers[i].data(), 0, 0, 0);
-		}
-		std::vector<std::vector<int>> island_strokes(std::max(island_num, 1));
-		for (int s = 0; s < stroke_num; s++) {
-			int best_island = 0;
-			size_t best_count = 0;
-			for (int i = 0; i < island_num; i++) {
-				size_t count = 0;
-				for (const Vec& v : layout.strokes[s]) {
-					const int x = (int)v.x, y = (int)v.y;
-					if (x >= 0 && x < map->w && y >= 0 && y < map->h && island_covers[i][(size_t)y * map->w + x].a >= 128) count++;
-				}
-				if (count > best_count) { best_count = count; best_island = i; }
-			}
-			island_strokes[best_island].push_back(s);
-		}
-		for (int i = 0; i < island_num && stroke_num; i++) {
-			if (!island_strokes[i].empty()) continue;
-			double best = 1e30;
-			int nearest = 0;
-			for (int y = 0; y < map->h; y += 2) {
-				for (int x = 0; x < map->w; x += 2) {
-					if (!island_covers[i][(size_t)y * map->w + x].a) continue;
-					for (int s = 0; s < stroke_num; s++) {
-						double d, along;
-						size_t index;
-						nearest_on_line(layout.strokes[s], { x + 0.5, y + 0.5 }, d, along, index);
-						if (d < best) { best = d; nearest = s; }
-					}
-				}
-			}
-			island_strokes[i].push_back(nearest);
-		}
-		std::vector<double> stroke_start(stroke_num);
-		for (int s = 0; s < stroke_num; s++) stroke_start[s] = s ? stroke_start[s - 1] + layout.lengths[s - 1] : layout.start;
-		// 1つのアイランドに複数の画がある時だけ、画ごとの領域を求める(まだ分割していない所)
-		std::vector<bool> needs_region(stroke_num, false);
-		for (const auto& list : island_strokes) if (list.size() > 1) for (int s : list) needs_region[s] = true;
-		// 画ごとの領域: 線の太さの中に入る画素のうち、つながった最大の塊だけにする
-		// (中心線がフォントの線とずれて別の線を通っても、離れた場所の線がその画として先に現れない)
-		std::vector<std::vector<char>> regions(stroke_num);
-		for (int s = 0; s < stroke_num; s++) {
-			if (!needs_region[s]) continue;
-			std::vector<char>& region = regions[s];
-			region.assign((size_t)map->w * map->h, 0);
-			for (int y = 0; y < map->h; y++) {
-				for (int x = 0; x < map->w; x++) {
-					if (!layout.cover[(size_t)y * map->w + x].a) continue;
-					double d, along;
-					size_t index;
-					nearest_on_line(layout.strokes[s], { x + 0.5, y + 0.5 }, d, along, index);
-					if (d <= layout.halves[s][index] + 0.25) region[(size_t)y * map->w + x] = 1;
-				}
-			}
-			size_t best_size = 0;
-			char best_label = 0, label = 1;
-			std::vector<size_t> stack;
-			for (size_t start = 0; start < region.size(); start++) {
-				if (region[start] != 1) continue;
-				if (label == 127) break;
-				label++;
-				size_t size = 0;
-				region[start] = label;
-				stack.push_back(start);
-				while (!stack.empty()) {
-					const size_t at = stack.back();
-					stack.pop_back();
-					size++;
-					const int px = (int)(at % map->w);
-					auto visit = [&](size_t n) { if (region[n] == 1) { region[n] = label; stack.push_back(n); } };
-					if (px > 0) visit(at - 1);
-					if (px + 1 < map->w) visit(at + 1);
-					if (at >= (size_t)map->w) visit(at - map->w);
-					if (at + map->w < region.size()) visit(at + map->w);
-				}
-				if (size > best_size) { best_size = size; best_label = label; }
-			}
-			for (char& value : region) value = value == best_label && best_label ? 1 : 0;
-		}
-		// 画素の時刻は、属するアイランドの画だけで決める(他の画へはみ出さない)。複数のアイランドに属する所は最も早いものになる。
-		// 同じアイランドに複数の画がある時は、領域に入る画のうち最も早く通るものの時刻にする。
-		// どの領域にも入らなければ、太さに対して最も近い画にする(細い線のすぐ外にある太い線の端を、細い線のものにしない)
-		std::vector<unsigned char> island_count;
-		if (island_num >= 2) {
-			island_count.assign((size_t)map->w * map->h, 0);
-			for (const auto& cover : island_covers) {
-				for (size_t i = 0; i < cover.size(); i++) if (cover[i].a) island_count[i]++;
-			}
-		}
-		for (int island = 0; island < std::max(island_num, 1); island++) {
-			const std::vector<int>& list = island_strokes[island];
-			for (int y = 0; y < map->h; y++) {
-				for (int x = 0; x < map->w; x++) {
-					const size_t at_pixel = (size_t)y * map->w + x;
-					if (island_num ? !island_covers[island][at_pixel].a : !layout.cover[at_pixel].a) continue;
-					float& time = map->time[at_pixel];
-					double value;
-					if (list.empty()) {
-						value = layout.start + layout.length;
-					} else {
-						const Vec v{ x + 0.5, y + 0.5 };
-						double best = 1e30, nearest_time = 0, early = 1e30;
-						for (int s : list) {
-							double d, along;
-							size_t index;
-							nearest_on_line(layout.strokes[s], v, d, along, index);
-							const double half = layout.halves[s][index];
-							const double at = stroke_start[s] + along;
-							if (d / half < best) { best = d / half; nearest_time = at; }
-							if (list.size() > 1 && regions[s][at_pixel] && at < early) early = at;
-						}
-						value = early < 1e30 ? early : nearest_time;
-					}
-					const float normalized = (float)(value / map->total);
-					if (time < 0 || normalized < time) time = normalized;
-					if (!island_count.empty() && island_count[at_pixel] >= 2) {
-						int& layer = map->layer_index[at_pixel];
-						if (layer < 0) {
-							layer = (int)map->layers.size();
-							map->layers.emplace_back();
-						}
-						map->layers[layer].push_back({ normalized, island_covers[island][at_pixel].a / 255.0f });
-					}
-				}
-			}
-		}
-	}
-	// 本体の画像の縁は自前の塗りより少し広いことがあるので、隣の時刻で埋める
-	for (int pass = 0; pass < 2; pass++) {
-		const std::vector<float> copy = map->time;
-		for (int y = 1; y + 1 < map->h; y++) {
-			for (int x = 1; x + 1 < map->w; x++) {
+	map->owner.assign((size_t)map->w * map->h, -1);
+	for (int g = 0; g < (int)model.size() && g < (int)source.boxes.size(); g++) {
+		const PenMap::Box& to = map->boxes[g];
+		const PenMap::Box& from = source.boxes[g];
+		if (!to.any || !from.any) continue;
+		const double rx = to.x1 - to.x0 > 0 ? (from.x1 - from.x0) / (to.x1 - to.x0) : 1;
+		const double ry = to.y1 - to.y0 > 0 ? (from.y1 - from.y0) / (to.y1 - to.y0) : 1;
+		const int left = (int)std::floor(to.x0) - 3 - map->x0, right = (int)std::ceil(to.x1) + 3 - map->x0;
+		const int top = (int)std::floor(to.y0) - 3 - map->y0, bottom = (int)std::ceil(to.y1) + 3 - map->y0;
+		for (int y = std::max(top, 0); y < std::min(bottom, map->h); y++) {
+			const int sy = (int)std::floor(from.y0 + (map->y0 + y + 0.5 - to.y0) * ry) - source.y0;
+			if (sy < 0 || sy >= source.h) continue;
+			for (int x = std::max(left, 0); x < std::min(right, map->w); x++) {
+				const int sx = (int)std::floor(from.x0 + (map->x0 + x + 0.5 - to.x0) * rx) - source.x0;
+				if (sx < 0 || sx >= source.w) continue;
+				const size_t from_at = (size_t)sy * source.w + sx;
+				if (source.owner[from_at] != g || source.time[from_at] < 0) continue;
 				const size_t at = (size_t)y * map->w + x;
-				if (copy[at] >= 0) continue;
-				float best = -1;
-				for (const size_t n : { at - 1, at + 1, at - map->w, at + map->w }) {
-					if (copy[n] >= 0 && (best < 0 || copy[n] < best)) best = copy[n];
+				if (map->time[at] < 0 || source.time[from_at] < map->time[at]) {
+					map->time[at] = source.time[from_at];
+					map->layer_index[at] = source.layer_index[from_at];
+					map->owner[at] = g;
 				}
-				map->time[at] = best;
 			}
 		}
 	}
+	fill_pen_edges(*map);
 	return map;
 }
 
@@ -5763,10 +6068,19 @@ float pen_time_at(const PenMap& map, double x, double y) {
 }
 
 std::mutex g_pen_mutex;
-std::map<double, std::shared_ptr<PenMap>> g_pen_maps;	// エフェクトのIDごと
+std::map<double, std::shared_ptr<PenSlot>> g_pen_slots;	// エフェクトのIDごと
 
-// pen(data, w, h, x, y, 全体のw, 全体のh, ox, oy, アンカー, ハンドル, 輪郭情報, 筆順, 形状1のアンカー, 形状1のハンドル, エフェクトのID, 進行0～1):
-// 進行の時点でまだ書かれていない画素を消す。(x, y)はこの画像の全体の画像の中での位置
+// 補間の式(Luaの drawPts[i] = pts[i] + (pts2[i] - pts[i]) * t と同じ計算にする)
+std::vector<double> blend_values(const std::vector<double>& a, const std::vector<double>& b, size_t count, double t) {
+	std::vector<double> out(count);
+	for (size_t i = 0; i < count; i++) out[i] = a[i] + (b[i] - a[i]) * t;
+	return out;
+}
+
+// pen(data, w, h, x, y, 全体のw, 全体のh, ox, oy, アンカー, ハンドル, 輪郭情報, 筆順, 形状1のアンカー, 形状1のハンドル, エフェクトのID, 進行0～1
+//     [, 形状2のアンカー, 形状2のハンドル, 補間0～1]):
+// 進行の時点でまだ書かれていない画素を消す。(x, y)はこの画像の全体の画像の中での位置。
+// 補間の途中(0と1の間)は、近い方の端の形の表を伸縮して使う(形状2を渡さない時は、今の形で表を作る)
 void module_pen(SCRIPT_MODULE_PARAM* param) {
 	auto data = static_cast<PIXEL_RGBA*>(param->get_param_data(0));
 	const int w = param->get_param_int(1), h = param->get_param_int(2);
@@ -5777,16 +6091,49 @@ void module_pen(SCRIPT_MODULE_PARAM* param) {
 	const std::vector<double> meta = read_array(param, 11);
 	const std::vector<double> points = merge_points(read_array(param, 9), read_array(param, 10), meta);
 	const std::vector<double> stroke_values = read_array(param, 12);
-	const std::vector<double> reference = merge_points(read_array(param, 13), read_array(param, 14), meta);
+	const std::vector<double> anchors1 = read_array(param, 13), handles1 = read_array(param, 14);
+	const std::vector<double> reference = merge_points(anchors1, handles1, meta);
 	const double id = param->get_param_double(15), progress = param->get_param_double(16);
 	if (points.empty()) return;
-	const UINT32 key = hash_points(points) ^ (hash_points(meta) * 31) ^ (hash_points(stroke_values) * 131);
-	std::shared_ptr<PenMap> map;
+	const double t = param->get_param_num() > 19 ? param->get_param_double(19) : 0;
+	// 補間の途中の時だけ、端の形(t=1の形はLuaと同じ式で作る)を使う
+	std::vector<double> end_points;
+	if (t > 0 && t < 1 && meta.size() > 9) {
+		const std::vector<double> anchors2 = read_array(param, 17), handles2 = read_array(param, 18);
+		const size_t anchor_count = (size_t)meta[8] * 2, handle_count = (size_t)meta[9] * 2;
+		if (anchors1.size() >= anchor_count && anchors2.size() >= anchor_count && handles1.size() >= handle_count && handles2.size() >= handle_count) {
+			end_points = merge_points(blend_values(anchors1, anchors2, anchor_count, 1.0), blend_values(handles1, handles2, handle_count, 1.0), meta);
+			if (end_points.size() != points.size() || reference.size() != points.size()) end_points.clear();
+		}
+	}
+	std::shared_ptr<PenSlot> slot;
 	{
 		std::lock_guard<std::mutex> lock(g_pen_mutex);
-		auto& slot = g_pen_maps[id];
-		if (!slot || slot->key != key) slot = build_pen_map(points, meta, key, parse_strokes(stroke_values, (size_t)meta[5]), reference);
-		map = slot;
+		auto& found = g_pen_slots[id];
+		if (!found) found = std::make_shared<PenSlot>();
+		slot = found;
+	}
+	std::shared_ptr<PenMap> map;
+	{
+		// 作り直しはエフェクトごとに行う(別のオブジェクトの表を作る間は待たない)
+		std::lock_guard<std::mutex> lock(slot->mutex);
+		const std::vector<GlyphStrokes> custom = parse_strokes(stroke_values, (size_t)meta[5]);
+		const EdModel reference_model = reference.empty() ? EdModel() : load_model(reference, meta, 0);
+		const EdModel model = load_model(points, meta, 0);
+		if (end_points.empty()) {
+			map = cached_pen_map(*slot, model, reference_model, custom);
+		} else {
+			const UINT64 warped_key = hash_values(hash_mix(13, points), t);
+			if (slot->warped && slot->warped_key == warped_key) {
+				map = slot->warped;
+			} else {
+				const std::shared_ptr<PenMap> source = t < 0.5 ? cached_pen_map(*slot, reference_model, reference_model, custom)
+					: cached_pen_map(*slot, load_model(end_points, meta, 0), reference_model, custom);
+				map = warp_pen_map(*source, model);
+				slot->warped_key = warped_key;
+				slot->warped = map;
+			}
+		}
 	}
 	// 書き進む先端は2ピクセルかけて現す(進行0では何も出ない)
 	const double edge = 2 / map->total;
@@ -5945,7 +6292,7 @@ EXTERN_C __declspec(dllexport) void InitializeConfig(CONFIG_HANDLE* handle) {
 }
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
-	host->set_plugin_information(L"テキストの輪郭パス化 v1.1.2 By teruyoshi");
+	host->set_plugin_information(L"テキストの輪郭パス化 v1.3 By teruyoshi");
 	g_edit_handle = host->create_edit_handle();
 	host->register_filter_plugin(&g_filter_table);
 	host->register_object_menu(L"輪郭パス\\輪郭を作成・更新", on_object_menu<true>);

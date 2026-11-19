@@ -1,4 +1,4 @@
---information:輪郭パス v1.1.2 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
+--information:輪郭パス v1.3 by teruyoshi | 輪郭生成で作ったテキストの輪郭をアンカーで編集して描画する
 --label:teruyoshi
 --select@objMode:オブジェクトの分け方=0,全体で1つのオブジェクト=0,文字ごとに個別オブジェクト=1,アイランドごとに個別オブジェクト=2
 --check@pen:ペンで書く,false
@@ -200,7 +200,8 @@ if meta[1] == 4 then
 	-- ペンで書く: 位置が合わせられる時だけ(テキストの設定を変えた時、動いていて形状2が無い時は全体を表示する)
 	local writing = pen and penT < 100 and same_text and (not moving or blend)
 	local function write_pen(data, x, y, pw, ph)
-		outline.pen(data, pw, ph, x, y, w0, h0, ox, oy, drawPts, drawHnd, meta, strokes, pts, hnd, obj.effect_id, penT / 100)
+		-- 補間の途中は、両端の形の表を伸縮して使う(毎フレーム表を作り直さない)。そのために形状2と補間の値も渡す
+		outline.pen(data, pw, ph, x, y, w0, h0, ox, oy, drawPts, drawHnd, meta, strokes, pts, hnd, obj.effect_id, penT / 100, pts2, hnd2, t)
 	end
 	-- タイムラインへ展開したオブジェクトは、自分のアイランドの輪郭だけを持ち、それだけを描く
 	local expanded = expandPart[1] == 1
@@ -211,6 +212,7 @@ if meta[1] == 4 then
 		local drawBase = nil
 		if not force and same_text and cache.ink and (not moving or blend) and baseMeta[1] == 4 and #base == (baseMeta[9] + baseMeta[10]) * 2 then
 			drawBase = base
+			-- 元の座標2が元の座標と同じ時、プラグインは元の座標2を持たない(0,0)。数が違えば補間せず元の座標を使う(同じ値を補間した時と結果は同じ)
 			if blend and t ~= 0 and #base2 == #base then
 				drawBase = {}
 				for i = 1, #base do drawBase[i] = base[i] + (base2[i] - base[i]) * t end

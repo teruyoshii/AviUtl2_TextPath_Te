@@ -1,4 +1,4 @@
---information:輪郭パス展開 v1.1.2 by teruyoshi | 「アイランドごとにオブジェクトへ展開」で作られる、輪郭だけを描くオブジェクト
+--information:輪郭パス展開 v1.3 by teruyoshi | 「アイランドごとにオブジェクトへ展開」で作られる、輪郭だけを描くオブジェクト
 --label:teruyoshi
 --color@textColor:文字色,0xffffff
 --check@pen:ペンで書く,false
@@ -142,7 +142,7 @@ if meta[1] == 4 and #place >= 17 then
 		local useSeam = not (blend and t ~= 0) and not outline.edited(pts, hnd, meta, -1)
 		outline.compose_part(data, 0, {}, { 0 }, r, g, b, ox, oy, x, y, w0, h0, pw, ph, 64, obj.effect_id, useSeam and seam or {})
 		if pen and penT < 100 then
-			outline.pen(data, pw, ph, x, y, w0, h0, ox, oy, drawPts, drawHnd, meta, strokes, pts, hnd, obj.effect_id, penT / 100)
+			outline.pen(data, pw, ph, x, y, w0, h0, ox, oy, drawPts, drawHnd, meta, strokes, pts, hnd, obj.effect_id, penT / 100, pts2, hnd2, t)
 		end
 		obj.putpixeldata("object", data, pw, ph)
 		-- 部品のずれは中心に入れる(obj.ox, obj.oyに入れると部品ごとに自分の位置を中心に回り、字がばらける)
